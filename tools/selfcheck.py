@@ -843,6 +843,15 @@ def _install_config_flow_stubs() -> None:
     infrared.STUB_EMITTERS = []
     infrared.async_get_emitters = lambda hass: list(infrared.STUB_EMITTERS)
 
+    # 实测步会直接调 `infrared.async_send_command(hass, emitter, command)` ——
+    # 记下调用，供 test 步断言"真的发出去了"。
+    infrared.STUB_SENT = []
+
+    async def _stub_async_send_command(hass, emitter, command, **kwargs):
+        infrared.STUB_SENT.append((emitter, command))
+
+    infrared.async_send_command = _stub_async_send_command
+
 
 def _schema_options(schema, key: str) -> dict | None:
     """从 `vol.Schema` 里取出某个键的 `vol.In` 选项（断言下拉框内容用）。
@@ -973,12 +982,41 @@ def check_config_flow() -> None:
         check("TCL电视-1" in label47, "device 步列出 TCL电视-1", f"实际 {label47!r}")
         check("RCA" in label47, f"型号附 irext 协议提示 -> {label47!r}")
 
-        # ⑥ 选型号 -> 建 entry
+        # ⑥ 选型号 -> 进 test 步（发实测码，**不直接建 entry**）
         flow = new_flow()
         flow._emitter = EMITTER
         flow._category = 2
         flow._brand = 14
         await flow.async_step_device({"device": "47"})
+        check(flow.shown.get("step_id") == "test", "选完型号 -> 进 test 步（实测确认）")
+        check(
+            len(infrared.STUB_SENT) == 1 and infrared.STUB_SENT[0][0] == EMITTER,
+            "test 步立即经所选 emitter 发出一帧测试码",
+            f"实际 {infrared.STUB_SENT!r}",
+        )
+        cmd = infrared.STUB_SENT[0][1]
+        check(
+            getattr(cmd, "modulation", None) == 38000
+            and len(cmd.get_raw_timings()) >= 2
+            and any(t < 0 for t in cmd.get_raw_timings()),
+            "测试码 = 38 kHz 载波 + 非空带符号时序",
+            f"实际 modulation={getattr(cmd, 'modulation', None)}, "
+            f"n={len(cmd.get_raw_timings())}",
+        )
+        opts = _schema_options(flow.shown["data_schema"], "test_result") or {}
+        check(
+            list(opts) == ["ok", "retry", "skip"],
+            f"test 步下拉 = ok/retry/skip（{opts}）",
+        )
+
+        # ⑥-b 没反应 -> retry 退回 device 步重选
+        await flow.async_step_test({"test_result": "retry"})
+        check(flow.shown.get("step_id") == "device", "选『没反应』-> 退回 device 步重选")
+
+        # ⑥-c 重选后确认有反应 -> 建 entry
+        await flow.async_step_device({"device": "47"})
+        infrared.STUB_SENT.clear()
+        await flow.async_step_test({"test_result": "ok"})
         created = flow.created
         check(
             created["title"] == "TCL电视-1",
@@ -1539,6 +1577,26 @@ def check_ac() -> None:
             f"ac_device 列出 {len(devices)} 型号（含 11272）",
         )
         await flow.async_step_ac_device({"device": "irda_new_ac_11272.bin"})
+        check(
+            flow.shown.get("step_id") == "ac_test",
+            "选完空调型号 -> 进 ac_test 步（发关机实测帧）",
+        )
+        check(
+            len(infrared.STUB_SENT) == 1 and infrared.STUB_SENT[0][0] == EMITTER,
+            "ac_test 立即发出一帧关机测试码",
+            f"实际 {infrared.STUB_SENT!r}",
+        )
+        ac_timings = infrared.STUB_SENT[0][1].get_raw_timings()
+        check(
+            len(ac_timings) >= 2 and any(t < 0 for t in ac_timings),
+            f"关机帧非空且带符号（{len(ac_timings)} 个时序值）",
+        )
+        # 没反应 -> 退回重选；有反应 -> 建 entry
+        await flow.async_step_ac_test({"test_result": "retry"})
+        check(flow.shown.get("step_id") == "ac_device", "空调『没反应』-> 退回 ac_device 步")
+        await flow.async_step_ac_device({"device": "irda_new_ac_11272.bin"})
+        infrared.STUB_SENT.clear()
+        await flow.async_step_ac_test({"test_result": "ok"})
         created = flow.created
         data = created["data"]
         check(
@@ -1578,11 +1636,11 @@ def main() -> int:
     #    `CHECKS + len(SKIPPED)` 恒定等于下面的常数，且**与形态无关**：发布形态下
     #    被外部依赖挡掉的那两项会计入 SKIPPED，所以两者相加仍然相等。
     #    新增/删除 check 时必须同步这个数字。
-    #      [1]~[8] + [9] config_flow 18 项 = 79
-    #      + [10] button 平台 21 项        = 100
-    #      + [11] services.yaml 4 项       = 104
-    #      + [12] AC 码库 + climate 36 项  = 140
-    expected_total = 140
+    #      [1]~[8] + [9] config_flow 23 项 = 84   （⑥ 实测步 test +5）
+    #      + [10] button 平台 21 项        = 105
+    #      + [11] services.yaml 4 项       = 109
+    #      + [12] AC 码库 + climate 40 项  = 149  （ac_test 实测步 +4）
+    expected_total = 149
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(

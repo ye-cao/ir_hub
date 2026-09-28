@@ -18,9 +18,16 @@
       },
       "device": {
         "title": "IR Hub — model",
-        "description": "{brand} — {count} models. The protocol hint is informational only: the real carrier is often different, so test 38 kHz first.",
+        "description": "{brand} — {count} models. The protocol hint is informational only: the real carrier is often different, so test 38 kHz first.\n\nThe next step transmits a test frame — keep the device in line of sight.",
         "data": {
           "device": "Model"
+        }
+      },
+      "test": {
+        "title": "IR Hub — Test frame sent",
+        "description": "**A test frame (key: {key}) was just sent to {brand}.**\n\nWatch the device: if it reacted (power on / LED blink / action), pick \"It worked\" to finish; otherwise go back and pick another model — no throwaway entries. Choose \"Skip\" if you are not near the device.",
+        "data": {
+          "test_result": "Did the device react?"
         }
       },
       "ac_brand": {
@@ -36,6 +43,13 @@
         "data": {
           "device": "Model"
         }
+      },
+      "ac_test": {
+        "title": "IR Hub — AC test frame sent",
+        "description": "**An OFF frame was just sent to {brand} (model {model}).**\n\nIf the AC beeped or powered down, pick \"It worked\" to finish; otherwise go back and pick another model. Choose \"Skip\" if you are not near the unit.",
+        "data": {
+          "test_result": "Did the AC react?"
+        }
       }
     },
     "abort": {
@@ -45,6 +59,10 @@
       "no_devices": "This brand has no models in the code library.",
       "device_gone": "That model is no longer in the code library.",
       "ac_decode_failed": "This model's code data failed to decode (corrupt irext data). Try another model."
+    },
+    "error": {
+      "send_failed": "Sending the test frame failed (emitter offline or refused). Retry later, skip the test, or go back.",
+      "no_test_key": "This model has no usable test code in the library. You can skip the test and finish anyway."
     }
   },
   "options": {

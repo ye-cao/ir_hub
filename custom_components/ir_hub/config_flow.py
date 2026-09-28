@@ -1,13 +1,16 @@
 """Config flow / Options flow for IR Hub.
 
-添加流程（三步表单）：
+添加流程（四步表单）：
     1. user    —— 选一个 infrared emitter（来自 ESPHome 的 ir_rf_proxy 实体）
-                  + 选设备大类（电视机 / 机顶盒 / 风扇 …）
+                  + 选设备大类（空调 / 电视机 / 机顶盒 / 风扇 …）
     2. brand   —— 选品牌
-    3. device  —— 选型号 → 建 entry
+    3. device  —— 选型号
+    4. test    —— **发一帧实测码**（设备=power 键；空调=关机帧），用户确认
+                  设备有反应才建 entry；没反应退回第 3 步重选，不生成废 entry
+                  （对齐 SmartAC 的"测试通过才加入"体验）
 
-建完之后，`remote.<品牌>_<型号>` 就出现了；按键名即 activity_list。
-载波频率与发送次数在 **选项** 里改（OptionsFlow）—— 因为
+建完之后，`remote.<品牌>_<型号>`（或空调的 `climate.*`）就出现了；按键名即
+activity_list。载波频率与发送次数在 **选项** 里改（OptionsFlow）—— 因为
 "38k 还是 56k" 只能靠实测定，留个不用重加集成的开关很重要。
 """
 
@@ -35,9 +38,20 @@ from .const import (
     DEFAULT_REPEATS,
     DOMAIN,
 )
+from .ir_command import build_raw_command
 from .library import CodeLibrary
 
 _LOGGER = logging.getLogger(__name__)
+
+# 实测确认步的下拉选项（`vol.In(字典)`：key 是提交值，value 是显示文本）。
+# "skip" 留给"人不在设备旁 / 发射器还没上电"的场合 —— 不强制。
+CONF_TEST_RESULT = "test_result"
+TEST_RETRY = "retry"
+TEST_RESULT_OPTIONS = {
+    "ok": "有反应，完成添加",
+    "retry": "没反应，退回重选型号",
+    "skip": "跳过测试，直接添加",
+}
 
 
 class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -52,6 +66,23 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._library: CodeLibrary | None = None
         self._ac_library: AcLibrary | None = None
         self._ac_brand: str = ""
+        self._device_id: int = 0
+        self._ac_bin: str = ""
+        self._ac_code: dict | None = None
+
+    # ------------------------------------------------------------------ 工具
+
+    async def _async_send_test(self, timings: list[int]) -> None:
+        """把一帧测试码直接经所选 emitter 发出去（此刻还没有任何实体）。
+
+        `infrared.async_send_command(hass, emitter_entity_id, command)` 是
+        infrared building block 的公开 API —— consumer 实体的 `_send_command()`
+        底层走的也是它，config flow 阶段直接调它是合法路径。
+        """
+        command = build_raw_command(
+            timings, carrier=DEFAULT_CARRIER, repeats=DEFAULT_REPEATS
+        )
+        await infrared.async_send_command(self.hass, self._emitter, command)
 
     # ------------------------------------------------------------------ 工具
 
@@ -155,19 +186,10 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             device = library.get_device(device_id)
             if device is None:
                 return self.async_abort(reason="device_gone")
-            return self.async_create_entry(
-                # 型号常自带品牌（如「TCL电视-1」）⇒ 交给 display_name 判断要不要前缀，
-                # 否则实体 id 会变成 `remote.tcl_tcl电视_1`。
-                title=library.display_name(brand_name, device["name"]),
-                data={
-                    CONF_EMITTER: self._emitter,
-                    CONF_CATEGORY: self._category,
-                    CONF_BRAND: self._brand,
-                    CONF_DEVICE: device_id,
-                    CONF_CARRIER: DEFAULT_CARRIER,
-                    CONF_REPEATS: DEFAULT_REPEATS,
-                },
-            )
+            # ⭐ 不直接建 entry —— 先去 test 步发一帧实测码，确认设备有反应
+            #    再落库，避免"加错了删掉重来"。
+            self._device_id = device_id
+            return await self.async_step_test()
 
         devices: dict[str, str] = {}
         for device in library.devices_in(self._category, self._brand):
@@ -188,6 +210,63 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "brand": brand_name,
                 "count": str(len(devices)),
+            },
+        )
+
+    # ------------------------------------------------------- 发送实测（第 4 步）
+
+    async def async_step_test(self, user_input: dict | None = None):
+        """发一帧实测码让用户确认 —— 有反应才建 entry，没反应退回重选。
+
+        对齐 SmartAC 的体验：码库选型只是"候选"，**设备真响应了才算数**。
+        测试键取 power（key_names 已把 power 排第一），没有 power 就取
+        第一个可用键。
+        """
+        library = await self._async_library()
+        device = library.get_device(self._device_id)
+        if device is None:
+            return self.async_abort(reason="device_gone")
+        brand_name = library.brands.get(self._brand) or f"品牌 {self._brand}"
+
+        if user_input is not None:
+            if user_input[CONF_TEST_RESULT] == TEST_RETRY:
+                return await self.async_step_device()
+            return self._async_finish_device(library, device)
+
+        errors: dict[str, str] = {}
+        keys = library.key_names(device)
+        key = keys[0] if keys else None
+        timings = library.get_timings(self._device_id, key) if key else None
+        if timings is None:
+            errors["base"] = "no_test_key"
+        else:
+            try:
+                await self._async_send_test(timings)
+            except Exception:  # noqa: BLE001 —— emitter 掉线/拒发都必须落到表单
+                _LOGGER.exception("IR Hub: 测试码发送失败（emitter=%s）", self._emitter)
+                errors["base"] = "send_failed"
+
+        return self.async_show_form(
+            step_id="test",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_TEST_RESULT): vol.In(TEST_RESULT_OPTIONS)}
+            ),
+            errors=errors or None,
+            description_placeholders={"brand": brand_name, "key": key or "—"},
+        )
+
+    def _async_finish_device(self, library: CodeLibrary, device: dict):
+        """建普通设备的 entry（型号常自带品牌 ⇒ display_name 去重前缀）。"""
+        brand_name = library.brands.get(self._brand) or f"品牌 {self._brand}"
+        return self.async_create_entry(
+            title=library.display_name(brand_name, device["name"]),
+            data={
+                CONF_EMITTER: self._emitter,
+                CONF_CATEGORY: self._category,
+                CONF_BRAND: self._brand,
+                CONF_DEVICE: int(device["id"]),
+                CONF_CARRIER: DEFAULT_CARRIER,
+                CONF_REPEATS: DEFAULT_REPEATS,
             },
         )
 
@@ -227,28 +306,15 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             bin_name = user_input[CONF_DEVICE]
             # ⭐ 建 entry 前先解码一遍：坏 bin 在这里挡住（带原因 abort），
-            #    不要等平台 setup 时才静默失败。
+            #    不要等平台 setup 时才静默失败。解码结果留给 ac_test 步发测试码。
             try:
-                await self.hass.async_add_executor_job(
+                self._ac_code = await self.hass.async_add_executor_job(
                     ac_library.load_device, bin_name
                 )
             except (OSError, ValueError) as err:
                 return self.async_abort(reason="ac_decode_failed")
-            title = CodeLibrary.display_name(
-                self._ac_brand,
-                f"空调 {bin_name.removesuffix('.bin').replace('irda_new_ac_', '')}",
-            )
-            return self.async_create_entry(
-                title=title,
-                data={
-                    CONF_EMITTER: self._emitter,
-                    CONF_CATEGORY: CATEGORY_AC,
-                    CONF_BRAND: self._ac_brand,
-                    CONF_DEVICE: bin_name,
-                    CONF_CARRIER: DEFAULT_CARRIER,
-                    CONF_REPEATS: DEFAULT_REPEATS,
-                },
-            )
+            self._ac_bin = bin_name
+            return await self.async_step_ac_test()
 
         devices = {
             dev["bin"]: f"型号 {dev['device_name']}"
@@ -263,6 +329,61 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "brand": self._ac_brand,
                 "count": str(len(devices)),
+            },
+        )
+
+    async def async_step_ac_test(self, user_input: dict | None = None):
+        """空调分支的实测步：发一帧**关机码**，确认空调有反应再建 entry。
+
+        为什么发 off 而不是开机：开机帧需要"模式×风速×温度"全组合才有意义，
+        而 off 是独立一帧、对所有空调语义唯一（滴一声/关机）—— 测试信号最干净。
+        """
+        ac_library = await self._async_ac_library()
+
+        if user_input is not None:
+            if user_input[CONF_TEST_RESULT] == TEST_RETRY:
+                return await self.async_step_ac_device()
+            return self._async_finish_ac(ac_library)
+
+        errors: dict[str, str] = {}
+        timings = (self._ac_code or {}).get("off") or []
+        try:
+            if not timings:
+                errors["base"] = "no_test_key"
+            else:
+                await self._async_send_test(timings)
+        except Exception:  # noqa: BLE001 —— emitter 掉线/拒发都必须落到表单
+            _LOGGER.exception("IR Hub: 空调测试码发送失败（emitter=%s）", self._emitter)
+            errors["base"] = "send_failed"
+
+        model_short = self._ac_bin.removesuffix(".bin").replace("irda_new_ac_", "")
+        return self.async_show_form(
+            step_id="ac_test",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_TEST_RESULT): vol.In(TEST_RESULT_OPTIONS)}
+            ),
+            errors=errors or None,
+            description_placeholders={
+                "brand": self._ac_brand,
+                "model": model_short,
+            },
+        )
+
+    def _async_finish_ac(self, ac_library: AcLibrary):
+        """建空调 entry（建完出 climate 温控面板）。"""
+        title = CodeLibrary.display_name(
+            self._ac_brand,
+            f"空调 {self._ac_bin.removesuffix('.bin').replace('irda_new_ac_', '')}",
+        )
+        return self.async_create_entry(
+            title=title,
+            data={
+                CONF_EMITTER: self._emitter,
+                CONF_CATEGORY: CATEGORY_AC,
+                CONF_BRAND: self._ac_brand,
+                CONF_DEVICE: self._ac_bin,
+                CONF_CARRIER: DEFAULT_CARRIER,
+                CONF_REPEATS: DEFAULT_REPEATS,
             },
         )
 
