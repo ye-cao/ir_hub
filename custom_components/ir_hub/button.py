@@ -48,13 +48,19 @@ from .const import (
     CONF_DEVICE,
     CONF_EMITTER,
     CONF_REPEATS,
+    CONF_TX_DELAY,
+    CONF_TX_TARGET,
+    CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
     DEFAULT_REPEATS,
+    DEFAULT_TX_DELAY,
     DOMAIN,
+    TX_INFRARED,
 )
 from .ir_command import build_raw_command
 from .library import CodeLibrary
+from .transmitter import async_send_timings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,7 +145,10 @@ async def async_setup_entry(
 
     carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
     repeats = max(1, int(data.get(CONF_REPEATS) or DEFAULT_REPEATS))
-    emitter = data[CONF_EMITTER]
+    # 发射通道（旧条目只有 CONF_EMITTER ⇒ 兼容回退为 infrared）
+    tx_type = data.get(CONF_TX_TYPE) or TX_INFRARED
+    tx_target = data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
+    tx_delay = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
 
     entities = [
         IrHubButton(
@@ -149,7 +158,9 @@ async def async_setup_entry(
             key=key,
             carrier=carrier,
             repeats=repeats,
-            emitter=emitter,
+            tx_type=tx_type,
+            tx_target=tx_target,
+            tx_delay=tx_delay,
             device_info=device_info,
             entity_id=f"button.{device_domain_slug}_{key_object_id(key)}",
         )
@@ -183,7 +194,9 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         key: str,
         carrier: int,
         repeats: int,
-        emitter: str,
+        tx_type: str,
+        tx_target: str,
+        tx_delay: float,
         device_info: DeviceInfo,
         entity_id: str,
     ) -> None:
@@ -196,8 +209,12 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         self._device_id = int(device["id"])
         self._key = key
 
-        # 基类靠这个属性跟踪 emitter 可用性 / 发命令
-        self._infrared_emitter_entity_id = emitter
+        # 发射通道：infrared 通道下基类靠 _infrared_emitter_entity_id 跟踪
+        # 可用性；其它通道跟踪被 async_added_to_hass 跳过，发码走 transmitter。
+        self._tx_type = tx_type
+        self._tx_target = tx_target
+        self._tx_delay = tx_delay
+        self._infrared_emitter_entity_id = tx_target
 
         self._carrier = carrier
         self._repeats = repeats
@@ -211,6 +228,25 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         # ⭐ 显式 entity_id：符号已在 key_object_id 里变成词，保证同一设备内唯一，
         #    不会出现 vol+ / vol- 都被 slugify 成 `vol` 而让 HA 加 `_2` 的情况。
         self.entity_id = entity_id
+
+    async def async_added_to_hass(self) -> None:
+        """infrared 通道跟随 emitter 可用性；其它通道无实体状态可跟，恒可用。"""
+        if self._tx_type == TX_INFRARED:
+            await super().async_added_to_hass()
+
+    async def _send_command(self, command) -> None:
+        """按通道路由：infrared 走 consumer 基类；其余由 transmitter 打包发服务。"""
+        if self._tx_type == TX_INFRARED:
+            await super()._send_command(command)
+            return
+        await async_send_timings(
+            self.hass,
+            self._tx_type,
+            self._tx_target,
+            command.get_raw_timings(),
+            carrier=command.modulation,
+            delay=self._tx_delay,
+        )
 
     async def async_press(self) -> None:
         """按一下 = 把这个键的时序发出去。"""

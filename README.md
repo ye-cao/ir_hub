@@ -27,9 +27,18 @@ IR Hub 实体 ─ infrared.async_send_command ─ infrared.<emitter> 实体
 | 项 | 要求 |
 |---|---|
 | Home Assistant | **≥ 2026.6.0**（`InfraredEmitterConsumerEntity` 落在 2026.6） |
-| ESPHome 固件 | 带 `infrared:` 实体（已验证至 2026.9.0） |
+| 发射器 | 四选一，见下表；自制方案示例为 ESPHome（已验证至 2026.9.0） |
 
-ESPHome 侧最小配置：
+**发射通道**（添加集成时选，对齐 SmartAC 的发射器抽象——没有自制硬件也能用现成的）：
+
+| 通道 | 目标 | 说明 |
+|---|---|---|
+| `infrared`（推荐） | infrared emitter 实体 | HA 官方红外体系，配 ESPHome `ir_rf_proxy` |
+| `broadlink` | `remote.*` 实体 | 现成遥控宝；µs→b64 包与 SmartAC 逐字节一致 |
+| `esphome` | `esphome.<动作>` | SmartAC 兼容契约（`{"command": [带符号时序]}`） |
+| `mqtt` | topic | Tasmota IRMQTTServer RAW JSON（刷固件即用） |
+
+ESPHome 侧最小配置（仅 `infrared` 通道需要）：
 
 ```yaml
 remote_transmitter:
@@ -67,7 +76,7 @@ infrared:
 
 > HA 在容器/虚拟机里跑的，注意把目录拷进**容器内**的 `/config`（Samba / File editor 插件均可）。
 
-添加流程：选发射器 + 大类 → 品牌 → 型号 → **实测确认**（自动发一帧测试码：设备=电源键，空调=关机帧；有反应才建 entry，没反应退回重选，人不在旁边可跳过）。
+添加流程：选发射通道 + 目标 → 大类 → 品牌 → 型号 → **实测确认**（自动发一帧测试码：设备=电源键，空调=关机帧；有反应才建 entry，没反应可「自动试下一个型号」——机顶盒这类多型号品牌不用逐个回下拉重选，试完全部自动停，人不在旁边可跳过）。**所有设备大类都有实测环节**。
 
 > 中文设备名会被 slugify 成拼音：`TCL电视-1` → `remote.tcldian_shi_1`。
 > 拿不准就去「开发者工具 → 状态」按前缀筛，别照中文猜。
@@ -122,6 +131,7 @@ data:
 |---|---|---|
 | 载波频率 (Hz) | 38000 | **别信码库协议名**——实测 TCL 电视标"RCA (56K)"却是 38 kHz 才响。设备没反应就换 38000 / 40000 / 56000 试 |
 | 发送次数 | 1 | HA 的 esphome emitter 会丢弃 `repeat_count`，故在时序层复制实现 |
+| Broadlink 延迟 | 0.5 秒 | 仅 Broadlink 通道有效（`remote.send_command` 的 `delay_secs`） |
 
 空调排障顺序：① 换载波试 → ② 换同品牌其它型号 bin → ③ 检查发射强度
 （直驱 LED 建议三极管驱动，`drive_strength: 40mA` 可拉满 GPIO 能力）。

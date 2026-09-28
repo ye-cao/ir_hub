@@ -2,10 +2,17 @@
   "config": {
     "step": {
       "user": {
-        "title": "IR Hub — 选择发射器与设备大类",
-        "description": "内置码库：{devices} 台设备（生成于 {generated}）。\n\n先选负责发码的红外发射器（即 ESPHome `ir_rf_proxy` 提供的 infrared 实体），再选设备大类。",
+        "title": "IR Hub — 选择发射通道",
+        "description": "内置码库：{devices} 台设备 + 1053 个空调型号。\n\n选一个发射通道：有自制 ESPHome 红外就用 infrared（推荐）；没有动手硬件也可以用现成的 Broadlink 遥控宝、刷了 Tasmota IRMQTTServer 的 MQTT 网关，或任何暴露了 ESPHome 动作的发射器（SmartAC 兼容）。",
         "data": {
-          "emitter": "红外发射器",
+          "tx_type": "发射通道"
+        }
+      },
+      "tx": {
+        "title": "IR Hub — 发射目标与设备大类",
+        "description": "通道：**{tx_type}**\n发射目标：{tx_target_hint}\n\n然后选设备大类。下一步选品牌/型号后会发实测码确认。",
+        "data": {
+          "tx_target": "发射目标",
           "category": "设备大类"
         }
       },
@@ -25,7 +32,7 @@
       },
       "test": {
         "title": "IR Hub — 发送实测码",
-        "description": "**已向 {brand} 发送测试码（按键：{key}）**。\n\n看一眼设备：有反应（开机 / 指示灯闪 / 动作）就选「有反应」完成添加；没反应就退回重选型号，避免加错再删。人不在设备旁可选「跳过」。",
+        "description": "**已向 {brand}（第 {index}/{total} 个：{model}）发送测试码（按键：{key}）**。\n\n看一眼设备：有反应（开机 / 指示灯闪 / 动作）就选「有反应」完成添加；没反应可以「自动试下一个型号」（不用退回重选，机顶盒这类多型号品牌最好用）或退回下拉重选；人不在设备旁可选「跳过」。",
         "data": {
           "test_result": "设备有反应吗？"
         }
@@ -46,7 +53,7 @@
       },
       "ac_test": {
         "title": "IR Hub — 发送空调测试码",
-        "description": "**已向 {brand}（型号 {model}）发送一帧关机码**。\n\n空调有「滴」一声或关机反应就选「有反应」完成添加；没反应退回重选型号。人不在空调旁可选「跳过」。",
+        "description": "**已向 {brand}（第 {index}/{total} 个：型号 {model}）发送一帧关机码**。\n\n空调有「滴」一声或关机反应就选「有反应」完成添加；没反应可以「自动试下一个型号」或退回重选。人不在空调旁可选「跳过」。",
         "data": {
           "test_result": "空调有反应吗？"
         }
@@ -58,21 +65,25 @@
       "no_brands": "该大类的码库里没有品牌。",
       "no_devices": "该品牌的码库里没有型号。",
       "device_gone": "该型号已不在码库中。",
-      "ac_decode_failed": "该型号的码库数据无法解码（irext 数据缺损）。请换一个型号试试。"
+      "ac_decode_failed": "该型号的码库数据无法解码（irext 数据缺损）。请换一个型号试试。",
+      "test_exhausted": "品牌内的型号都试完了还没有反应 —— 检查发射器对准设备/载波频率（选项里换 56k 试试），或换个品牌再试。"
     },
     "error": {
       "send_failed": "测试码发送失败（发射器不在线或拒发）。可稍后重试、跳过测试，或退回重选。",
-      "no_test_key": "该型号的码库里没有可用的测试码。可直接跳过测试完成添加。"
+      "no_test_key": "该型号的码库里没有可用的测试码。可直接跳过测试完成添加。",
+      "target_missing": "发射目标不存在或不可用（实体不在线 / ESPHome 动作未注册 / Broadlink 实体不存在），请检查后重填。",
+      "mqtt_missing": "MQTT 集成未加载 —— 请先在 HA 里配置 MQTT（broker），再选 MQTT 通道。"
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "IR Hub 设置",
-        "description": "「{title}」的设置。\n\n载波频率：绝大多数设备是 38000 Hz。**别相信码库里的协议名** —— 若设备没反应，在这里换 56000（或 40000）试试。\n发送次数：每按一次实际发几遍（1 = 只发一遍）。若设备「隔一次才响应」就把这个调大。",
+        "description": "「{title}」的设置。\n\n载波频率：绝大多数设备是 38000 Hz。**别相信码库里的协议名** —— 若设备没反应，在这里换 56000（或 40000）试试。\n发送次数：每按一次实际发几遍（1 = 只发一遍）。若设备「隔一次才响应」就把这个调大。\nBroadlink 延迟：仅 Broadlink 通道有效（两次发送之间的间隔秒数）。",
         "data": {
           "carrier": "载波频率 (Hz)",
-          "repeats": "发送次数"
+          "repeats": "发送次数",
+          "tx_delay": "Broadlink 延迟 (秒)"
         }
       }
     }

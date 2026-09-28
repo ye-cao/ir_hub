@@ -191,16 +191,20 @@ def check_manifests() -> None:
         )
         # data 键必须与 schema 里的 CONF_* 名一致（拼错会让表单显示原始键名）
         check(
-            set(cfg.get("step", {}).get("user", {}).get("data", {}))
-            == {"emitter", "category"},
-            f"{lang}: user 步 data 键 = emitter/category",
+            set(cfg.get("step", {}).get("user", {}).get("data", {})) == {"tx_type"},
+            f"{lang}: user 步 data 键 = tx_type",
+        )
+        check(
+            set(cfg.get("step", {}).get("tx", {}).get("data", {}))
+            == {"tx_target", "category"},
+            f"{lang}: tx 步 data 键 = tx_target/category",
         )
         check(
             set(
                 blob.get("options", {}).get("step", {}).get("init", {}).get("data", {})
             )
-            == {"carrier", "repeats"},
-            f"{lang}: options 步 data 键 = carrier/repeats",
+            == {"carrier", "repeats", "tx_delay"},
+            f"{lang}: options 步 data 键 = carrier/repeats/tx_delay",
         )
 
 
@@ -620,6 +624,8 @@ def _install_ha_stubs() -> type:
 
     ha_const.Platform = Platform
     ha_const.ATTR_TEMPERATURE = "temperature"
+    # SmartAC 参照实现（re/smartac/controller.py 差分对拍用）
+    ha_const.ATTR_ENTITY_ID = "entity_id"
 
     # `homeassistant.core.ServiceCall` —— `__init__.py` 用它做类型注解，
     # 配合 `from __future__ import annotations` 只需名字存在（不会求值）。
@@ -886,6 +892,209 @@ def _schema_defaults(schema) -> dict:
     return out
 
 
+def check_tx() -> None:
+    """发射通道抽象：Broadlink 与 SmartAC 参照实现**逐字节对拍** + 各通道路由。
+
+    SmartAC（re/smartac，MIT）是"兼容性"的锚点 —— 我们的 Broadlink 包必须
+    与它的 raw2broadlink 输出完全一致，才能保证现成遥控宝直接可用。
+    re/ 副本缺失时该项自动跳过（其余检查照常）。
+    """
+    import asyncio
+    import base64 as b64mod
+    import json as jsonmod
+    import random
+    import types
+
+    print("\n[tx] 发射通道抽象（broadlink 对拍 / esphome / mqtt / infrared）")
+    _install_protocols_stub()
+    _install_ha_stubs()
+    _install_config_flow_stubs()
+
+    tx_mod = load_module(
+        "_ir_hub_shim.transmitter", os.path.join(COMPONENT, "transmitter.py")
+    )
+    infrared = sys.modules["homeassistant.components.infrared"]
+    EMITTER = "infrared.ir_control_ir_transmitter"
+
+    class RecServices:
+        def __init__(self, have: set | None = None):
+            self.calls: list[tuple] = []
+            self._have = have or set()
+
+        def has_service(self, domain: str, service: str) -> bool:
+            return (domain, service) in self._have
+
+        async def async_call(self, domain, service, data=None, **kwargs):
+            self.calls.append((domain, service, data))
+
+    class FakeStates:
+        def __init__(self, ids: list[str]):
+            self._ids = ids
+
+        def async_all(self, domain: str):
+            return [
+                types.SimpleNamespace(entity_id=e, domain=e.split(".")[0])
+                for e in self._ids
+                if e.split(".")[0] == domain
+            ]
+
+        def get(self, entity_id: str):
+            for e in self._ids:
+                if e == entity_id:
+                    return types.SimpleNamespace(entity_id=e, domain=e.split(".")[0])
+            return None
+
+    def make_hass(have: set | None = None, state_ids: list[str] | None = None):
+        return types.SimpleNamespace(
+            services=RecServices(have), states=FakeStates(state_ids or [])
+        )
+
+    async def run():
+        # --- 1. Broadlink 打包：与 SmartAC raw2broadlink 逐字节对拍 ---
+        smartac_path = os.path.join(ROOT, "re", "smartac", "controller.py")
+        if os.path.exists(smartac_path):
+            smartac = load_module("_smartac_controller_ref", smartac_path)
+            rng = random.Random(20260928)
+            for trial in range(5):
+                pulses = [rng.randrange(200, 20000) for _ in range(rng.randrange(30, 200))]
+                ours = tx_mod.raw_to_broadlink_packet(pulses)
+                theirs = smartac.BroadlinkController.raw2broadlink(None, pulses)
+                check(
+                    ours == theirs,
+                    f"broadlink 包与 SmartAC 参照逐字节一致（样本 {trial + 1}，"
+                    f"{len(pulses)} 脉冲 / {len(ours)} 字节）",
+                )
+        else:
+            skip("broadlink 对拍", "re/smartac 参照副本缺失")
+
+        # 包结构：头 0x26 0x00 + 小端长度 + 0x0d 0x05（其后是 AES 补零）+ 16 字节对齐
+        packet = tx_mod.raw_to_broadlink_packet([9000, 4500] * 40)
+        array_len = int.from_bytes(packet[2:4], "little")
+        check(
+            packet[0:2] == b"\x26\x00"
+            and packet[4 + array_len : 6 + array_len] == b"\x0d\x05"
+            and (len(packet) + 4) % 16 == 0,
+            f"broadlink 包结构：0x26 头 / 小端长度 / 0x0d05 在补零前（{len(packet)} 字节）",
+        )
+
+        # --- 2. infrared 通道：走 infrared.async_send_command ---
+        hass = make_hass()
+        infrared.STUB_SENT.clear()
+        await tx_mod.async_send_timings(
+            hass, "infrared", EMITTER, [1000, -500, 300, -400], carrier=38000
+        )
+        check(
+            len(infrared.STUB_SENT) == 1
+            and infrared.STUB_SENT[0][0] == EMITTER
+            and infrared.STUB_SENT[0][1].get_raw_timings() == [1000, -500, 300, -400]
+            and infrared.STUB_SENT[0][1].modulation == 38000,
+            "infrared 通道 -> infrared.async_send_command（时序/载波原样）",
+        )
+
+        # --- 3. esphome 通道：服务名去前缀 + command 带符号透传 ---
+        hass = make_hass()
+        await tx_mod.async_send_timings(
+            hass,
+            "esphome",
+            "esphome.ir_control_send_raw_command",
+            [1000, -500, 300, -400],
+            carrier=38000,
+        )
+        check(
+            hass.services.calls == [
+                ("esphome", "ir_control_send_raw_command",
+                 {"command": [1000, -500, 300, -400]})
+            ],
+            "esphome 通道 -> 服务名去 esphome. 前缀，command 带符号透传（SmartAC 契约）",
+            f"实际 {hass.services.calls!r}",
+        )
+
+        # --- 4. broadlink 通道：b64 包 + delay_secs ---
+        hass = make_hass()
+        await tx_mod.async_send_timings(
+            hass, "broadlink", "remote.bl", [9000, 4500, 560, -560], carrier=38000
+        )
+        call = hass.services.calls[0]
+        b64 = call[2]["command"][0]
+        check(
+            call[0] == "remote"
+            and call[1] == "send_command"
+            and call[2]["entity_id"] == "remote.bl"
+            and call[2]["delay_secs"] == 0.5
+            and b64.startswith("b64:")
+            and b64mod.b64decode(b64[4:]) == tx_mod.raw_to_broadlink_packet([9000, 4500, 560, 560]),
+            "broadlink 通道 -> remote.send_command（b64 包 = 全正脉冲打包，delay 0.5）",
+        )
+
+        # --- 5. mqtt 通道：Tasmota IRMQTTServer RAW JSON ---
+        hass = make_hass()
+        await tx_mod.async_send_timings(
+            hass, "mqtt", "tasmota_ir/cmnd/ir", [1000, -500, 300, -400], carrier=38000
+        )
+        domain, service, data = hass.services.calls[0]
+        payload = jsonmod.loads(data["payload"])
+        check(
+            (domain, service) == ("mqtt", "publish")
+            and data["topic"] == "tasmota_ir/cmnd/ir"
+            and payload == {
+                "Protocol": "RAW", "Bits": 0,
+                "Raw": "1000,500,300,400", "Frequency": 38000,
+            },
+            "mqtt 通道 -> Tasmota IRMQTTServer RAW JSON（正值序列 + 载波）",
+            f"实际 {payload!r}",
+        )
+
+        # --- 6. 未知通道 -> HomeAssistantError ---
+        from homeassistant.exceptions import HomeAssistantError
+
+        try:
+            await tx_mod.async_send_timings(
+                make_hass(), "carrier_pigeon", "x", [1, -1], carrier=38000,
+            )
+        except HomeAssistantError:
+            check(True, "未知通道 -> HomeAssistantError")
+        else:
+            check(False, "未知通道 -> HomeAssistantError", "竟然没抛")
+
+        # --- 7. async_validate_target：四通道 ---
+        hass = make_hass(
+            have={("esphome", "ir_control_send_raw_command"), ("mqtt", "publish")},
+            state_ids=["remote.broadlink_livingroom", "light.x"],
+        )
+        infrared.STUB_EMITTERS = [EMITTER]
+        check(
+            await tx_mod.async_validate_target(hass, "infrared", EMITTER) is None
+            and await tx_mod.async_validate_target(hass, "infrared", "infrared.ghost")
+            == "target_missing",
+            "validate infrared：存在通过 / 不存在 target_missing",
+        )
+        check(
+            await tx_mod.async_validate_target(
+                hass, "esphome", "esphome.ir_control_send_raw_command"
+            )
+            is None
+            and await tx_mod.async_validate_target(hass, "esphome", "esphome.ghost")
+            == "target_missing",
+            "validate esphome：服务存在通过 / 不存在 target_missing",
+        )
+        check(
+            await tx_mod.async_validate_target(hass, "broadlink", "remote.broadlink_livingroom") is None
+            and await tx_mod.async_validate_target(hass, "broadlink", "light.x")
+            == "target_missing",
+            "validate broadlink：remote 实体通过 / 非 remote target_missing",
+        )
+        check(
+            await tx_mod.async_validate_target(hass, "mqtt", "tasmota/cmnd/ir") is None
+            and await tx_mod.async_validate_target(
+                make_hass(), "mqtt", "tasmota/cmnd/ir"
+            )
+            == "mqtt_missing",
+            "validate mqtt：服务在通过 / 未加载 mqtt_missing",
+        )
+
+    asyncio.run(run())
+
+
 def check_config_flow() -> None:
     """跑 `config_flow.py` 的真实逻辑（**真 voluptuous** + stub homeassistant）。
 
@@ -906,7 +1115,47 @@ def check_config_flow() -> None:
     )
     EMITTER = "infrared.ir_control_ir_transmitter"
 
+    class FakeState:
+        def __init__(self, entity_id: str):
+            self.entity_id = entity_id
+            self.domain = entity_id.split(".")[0]
+
+    class FakeStates:
+        def __init__(self) -> None:
+            self._all = [
+                FakeState("remote.broadlink_livingroom"),
+                FakeState("remote.broadlink_bedroom"),
+                FakeState("light.not_a_remote"),
+            ]
+
+        def async_all(self, domain: str):
+            return [s for s in self._all if s.domain == domain]
+
+        def get(self, entity_id: str):
+            for state in self._all:
+                if state.entity_id == entity_id:
+                    return state
+            return None
+
+    class FakeServices:
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+            self._have = {
+                ("esphome", "ir_control_send_raw_command"),
+                ("remote", "send_command"),
+            }
+
+        def has_service(self, domain: str, service: str) -> bool:
+            return (domain, service) in self._have
+
+        async def async_call(self, domain, service, data=None, **kwargs):
+            self.calls.append((domain, service, data))
+
     class FakeHass:
+        def __init__(self) -> None:
+            self.states = FakeStates()
+            self.services = FakeServices()
+
         async def async_add_executor_job(self, func, *args):
             return func(*args)
 
@@ -933,48 +1182,61 @@ def check_config_flow() -> None:
     )
 
     async def run():
-        # ① 一个 emitter 都没有 -> abort（引导用户先去配 ESPHome）
+        # ① 一个 emitter 都没有 -> infrared 通道在 tx 步 abort（引导用户先去配 ESPHome）
         infrared.STUB_EMITTERS = []
         flow = new_flow()
         await flow.async_step_user()
-        check(flow.aborted == "no_emitters", "无 infrared emitter -> abort(no_emitters)")
+        check(flow.shown.get("step_id") == "user", "第 1 步 = 选发射通道（无 emitter 也出表单）")
+        await flow.async_step_user({"tx_type": "infrared"})
+        check(flow.aborted == "no_emitters", "infrared 通道无 emitter -> abort(no_emitters)")
 
-        # ② 有 emitter -> 出表单
+        # ② 有 emitter -> user 出通道下拉
         infrared.STUB_EMITTERS = [EMITTER]
         flow = new_flow()
         await flow.async_step_user()
         check(flow.shown["step_id"] == "user", "第 1 步 step_id = user")
-        schema = flow.shown["data_schema"]
+        tx_opts = _schema_options(flow.shown["data_schema"], "tx_type") or {}
         check(
-            _schema_options(schema, "emitter") == {EMITTER: None},
-            "emitter 下拉框列出全部可用发射器",
-        )
-        cats = _schema_options(schema, "category") or {}
-        check(
-            "电视机" in cats.get("2", "") and "空调" in cats.get("1", ""),
-            f"category 下拉框给出中文类别名 + 设备数（{len(cats)} 项）",
-            f"2 -> {cats.get('2')!r}, 1 -> {cats.get('1')!r}",
+            list(tx_opts) == ["infrared", "broadlink", "esphome", "mqtt"],
+            f"user 步给出 4 种发射通道（{list(tx_opts)}）",
         )
 
         # ③ 真 voluptuous 校验：确认 `vol.In(字典)` 提交回来的是 **key 字符串**
-        validated = schema({"emitter": EMITTER, "category": "2"})
+        validated = flow.shown["data_schema"]({"tx_type": "infrared"})
+        check(validated["tx_type"] == "infrared", "vol.In(字典) 返回 key 字符串")
+
+        # ④ infrared 通道 -> tx 步（目标下拉 + 大类下拉）
+        flow = new_flow()
+        await flow.async_step_user({"tx_type": "infrared"})
+        check(flow.shown.get("step_id") == "tx", "选 infrared -> 进 tx 步")
+        schema = flow.shown["data_schema"]
         check(
-            validated["category"] == "2" and validated["emitter"] == EMITTER,
+            _schema_options(schema, "tx_target") == {EMITTER: None},
+            "tx 步 emitter 下拉列出全部可用发射器",
+        )
+        cats = _schema_options(schema, "category") or {}
+        check(
+            "电视机" in cats.get("2", "") and "空调" in cats.get("ac", ""),
+            f"category 下拉框给出中文类别名 + AC 特殊项（{len(cats)} 项）",
+            f"2 -> {cats.get('2')!r}, ac -> {cats.get('ac')!r}",
+        )
+        validated = schema({"tx_target": EMITTER, "category": "2"})
+        check(
+            validated["category"] == "2" and validated["tx_target"] == EMITTER,
             "vol.In(字典) 返回 key 字符串（后续 int() 转换才成立）",
             f"实际 {validated!r}",
         )
 
-        # ④ 选大类 -> 进 brand 步
-        flow = new_flow()
-        await flow.async_step_user({"emitter": EMITTER, "category": "2"})
-        check(flow.shown.get("step_id") == "brand", "选完大类 -> 进 brand 步")
+        # ⑤ 提交 tx -> 进 brand 步
+        await flow.async_step_tx({"tx_target": EMITTER, "category": "2"})
+        check(flow.shown.get("step_id") == "brand", "选完通道+大类 -> 进 brand 步")
         brands = _schema_options(flow.shown["data_schema"], "brand") or {}
         check(
             len(brands) > 10 and all(k.isdigit() for k in brands),
             f"brand 步给出 {len(brands)} 个品牌（key 为数字字符串）",
         )
 
-        # ⑤ 选品牌 -> 进 device 步
+        # ⑤-b 选品牌 -> 进 device 步
         await flow.async_step_brand({"brand": "14"})
         check(flow.shown.get("step_id") == "device", "选完品牌 -> 进 device 步")
         devices = _schema_options(flow.shown["data_schema"], "device") or {}
@@ -984,11 +1246,17 @@ def check_config_flow() -> None:
 
         # ⑥ 选型号 -> 进 test 步（发实测码，**不直接建 entry**）
         flow = new_flow()
-        flow._emitter = EMITTER
+        flow._tx_type = "infrared"
+        flow._tx_target = EMITTER
         flow._category = 2
         flow._brand = 14
         await flow.async_step_device({"device": "47"})
         check(flow.shown.get("step_id") == "test", "选完型号 -> 进 test 步（实测确认）")
+        check(
+            47 in flow._key_candidates
+            and flow._key_index == flow._key_candidates.index(47),
+            "device 步记下品牌内全部候选与当前位次（『自动试下一个』用）",
+        )
         check(
             len(infrared.STUB_SENT) == 1 and infrared.STUB_SENT[0][0] == EMITTER,
             "test 步立即经所选 emitter 发出一帧测试码",
@@ -1005,9 +1273,29 @@ def check_config_flow() -> None:
         )
         opts = _schema_options(flow.shown["data_schema"], "test_result") or {}
         check(
-            list(opts) == ["ok", "retry", "skip"],
-            f"test 步下拉 = ok/retry/skip（{opts}）",
+            list(opts) == ["ok", "next", "retry", "skip"],
+            f"test 步下拉 = ok/next/retry/skip（{opts}）",
         )
+        check(
+            flow.shown["description_placeholders"].get("model") == "TCL电视-1"
+            and "index" in flow.shown["description_placeholders"],
+            "test 步占位符带型号与进度（index/total）",
+        )
+
+        # ⑥-a2 没反应 -> next 自动前进到品牌内下一个型号
+        devs14 = flow._key_candidates
+        await flow.async_step_test({"test_result": "next"})
+        if len(devs14) > 1:
+            expect_next = devs14[devs14.index(47) + 1]
+            check(
+                flow.shown.get("step_id") == "test" and flow._device_id == expect_next,
+                f"『自动试下一个』前进到品牌内下一型号（{expect_next}）",
+            )
+        else:
+            check(
+                flow.aborted == "test_exhausted",
+                "『自动试下一个』无更多候选 -> abort(test_exhausted)",
+            )
 
         # ⑥-b 没反应 -> retry 退回 device 步重选
         await flow.async_step_test({"test_result": "retry"})
@@ -1025,14 +1313,69 @@ def check_config_flow() -> None:
         data = created["data"]
         check(
             data["emitter"] == EMITTER
+            and data["tx_type"] == "infrared"
+            and data["tx_target"] == EMITTER
             and data["device"] == 47
             and data["category"] == 2
             and data["brand"] == 14
             and data["carrier"] == 38000
             and data["repeats"] == 1,
-            "entry data 完整（emitter/category/brand/device/carrier/repeats）",
+            "entry data 完整（tx 通道 + emitter 兼容别名 + category/brand/device/carrier/repeats）",
             f"实际 {data!r}",
         )
+
+        # ⑧ 其它发射通道：esphome / broadlink / mqtt 的 config flow 分支
+        f2 = new_flow()
+        await f2.async_step_user({"tx_type": "esphome"})
+        check(f2.shown.get("step_id") == "tx", "选 esphome -> 进 tx 步")
+        await f2.async_step_tx({"tx_target": "esphome.no_such_action", "category": "2"})
+        check(
+            (f2.shown.get("errors") or {}).get("base") == "target_missing",
+            "esphome 动作不存在 -> errors.target_missing",
+        )
+        await f2.async_step_tx(
+            {"tx_target": "esphome.ir_control_send_raw_command", "category": "2"}
+        )
+        check(f2.shown.get("step_id") == "brand", "esphome 动作存在 -> 进 brand 步")
+
+        f3 = new_flow()
+        await f3.async_step_user({"tx_type": "broadlink"})
+        bl_opts = _schema_options(f3.shown["data_schema"], "tx_target") or {}
+        check(
+            "remote.broadlink_livingroom" in bl_opts
+            and "light.not_a_remote" not in bl_opts,
+            f"broadlink 通道下拉只列 remote 域实体（{sorted(bl_opts)}）",
+        )
+        await f3.async_step_tx({"tx_target": "remote.broadlink_livingroom", "category": "2"})
+        check(f3.shown.get("step_id") == "brand", "broadlink 实体存在 -> 进 brand 步")
+
+        f4 = new_flow()
+        f4.hass.services.has_service = lambda domain, service: False
+        await f4.async_step_user({"tx_type": "mqtt"})
+        await f4.async_step_tx({"tx_target": "tasmota_ir/cmnd/ir", "category": "2"})
+        check(
+            (f4.shown.get("errors") or {}).get("base") == "mqtt_missing",
+            "MQTT 未加载 -> errors.mqtt_missing",
+        )
+
+        # ⑨ esphome 通道走完 test -> entry data 记 tx 通道且无 emitter 别名
+        infrared.STUB_SENT.clear()
+        f5 = new_flow()
+        f5.hass = new_flow().hass  # 独立 hass（防串扰）
+        f5._tx_type = "esphome"
+        f5._tx_target = "esphome.ir_control_send_raw_command"
+        f5._category = 2
+        f5._brand = 14
+        await f5.async_step_device({"device": "47"})
+        await f5.async_step_test({"test_result": "ok"})
+        d5 = f5.created["data"]
+        check(
+            d5["tx_type"] == "esphome"
+            and d5["tx_target"] == "esphome.ir_control_send_raw_command"
+            and "emitter" not in d5,
+            "esphome 通道 entry 只记 tx 字段（不写 emitter 别名）",
+        )
+
         check(
             flow_mod.IrHubConfigFlow.async_get_options_flow(None).__class__.__name__
             == "IrHubOptionsFlow",
@@ -1046,21 +1389,25 @@ def check_config_flow() -> None:
         check(options.shown["step_id"] == "init", "options 步 step_id = init")
         defaults = _schema_defaults(options.shown["data_schema"])
         check(
-            defaults.get("carrier") == 38000 and defaults.get("repeats") == 1,
-            "options 表单默认值来自 entry（38000 / 1）",
+            defaults.get("carrier") == 38000
+            and defaults.get("repeats") == 1
+            and defaults.get("tx_delay") == 0.5,
+            "options 表单默认值来自 entry（38000 / 1 / delay 0.5）",
             f"实际 {defaults!r}",
         )
         check(
-            options.shown["data_schema"]({"carrier": "40000", "repeats": "3"})
-            == {"carrier": 40000, "repeats": 3},
-            "options 对输入做 Coerce(int)（字符串 -> 整数）",
+            options.shown["data_schema"](
+                {"carrier": "40000", "repeats": "3", "tx_delay": "1"}
+            )
+            == {"carrier": 40000, "repeats": 3, "tx_delay": 1.0},
+            "options 对输入做 Coerce（字符串 -> int/float）",
         )
         options = flow_mod.IrHubOptionsFlow()
         options.config_entry = FakeEntry()
-        await options.async_step_init({"carrier": 56000, "repeats": 2})
+        await options.async_step_init({"carrier": 56000, "repeats": 2, "tx_delay": 1.5})
         check(
-            options.created["data"] == {"carrier": 56000, "repeats": 2},
-            "options 保存 carrier/repeats（改完自动 reload）",
+            options.created["data"] == {"carrier": 56000, "repeats": 2, "tx_delay": 1.5},
+            "options 保存 carrier/repeats/tx_delay（改完自动 reload）",
         )
 
     asyncio.run(run())
@@ -1147,7 +1494,7 @@ def check_button_platform() -> None:
         }
         options: dict = {}
 
-    def build(key: str):
+    def build(key: str, **entry_overrides):
         ent = button_mod.IrHubButton(
             entry=FakeEntry(),
             library=library,
@@ -1155,7 +1502,9 @@ def check_button_platform() -> None:
             key=key,
             carrier=38000,
             repeats=1,
-            emitter=emitter,
+            tx_type="infrared",
+            tx_target=emitter,
+            tx_delay=0.5,
             device_info={"identifiers": {(DOMAIN, "test-entry")}},
             entity_id=f"button.{ha_slugify(display)}_{koi(key)}",
         )
@@ -1171,8 +1520,10 @@ def check_button_platform() -> None:
     check(btn._attr_unique_id == "test-entry_vol_plus", f"unique_id = {btn._attr_unique_id}")
     check(btn._attr_icon == "mdi:volume-plus", f"图标 = {btn._attr_icon}")
     check(
-        btn._infrared_emitter_entity_id == emitter,
-        "把 emitter id 交给基类（供其跟踪 emitter 可用性）",
+        btn._infrared_emitter_entity_id == emitter
+        and btn._tx_type == "infrared"
+        and btn._tx_target == emitter,
+        "把发射通道交给实体（infrared：emitter id 供基类跟踪可用性）",
     )
     check(button_mod.PARALLEL_UPDATES == 0, "PARALLEL_UPDATES = 0（红外无状态，不轮询）")
 
@@ -1558,14 +1909,16 @@ def check_ac() -> None:
     async def run_flow():
         infrared.STUB_EMITTERS = [EMITTER]
         flow = new_flow()
-        await flow.async_step_user()
+        await flow.async_step_user({"tx_type": "infrared"})
+        check(flow.shown.get("step_id") == "tx", "选 infrared -> 进 tx 步")
         cats = _schema_options(flow.shown["data_schema"], "category") or {}
         check(
             "空调" in cats.get("ac", "") and "品牌" in cats.get("ac", ""),
             f"category 下拉含「空调 · 温控面板」特殊项（{cats.get('ac')!r}）",
         )
         flow = new_flow()
-        await flow.async_step_user({"emitter": EMITTER, "category": "ac"})
+        await flow.async_step_user({"tx_type": "infrared"})
+        await flow.async_step_tx({"tx_target": EMITTER, "category": "ac"})
         check(flow.shown.get("step_id") == "ac_brand", "选空调 -> 进 ac_brand 步")
         brands = _schema_options(flow.shown["data_schema"], "brand") or {}
         check("美的" in brands and len(brands) >= 200, f"ac_brand 列出 {len(brands)} 品牌")
@@ -1591,9 +1944,20 @@ def check_ac() -> None:
             len(ac_timings) >= 2 and any(t < 0 for t in ac_timings),
             f"关机帧非空且带符号（{len(ac_timings)} 个时序值）",
         )
-        # 没反应 -> 退回重选；有反应 -> 建 entry
+        # 没反应 -> next 自动试下一个；有反应 -> 建 entry
+        ac_bins = [d["bin"] for d in flow._ac_library.devices_in("美的")]
+        await flow.async_step_ac_test({"test_result": "next"})
+        if len(ac_bins) > 1:
+            expect_bin = ac_bins[ac_bins.index("irda_new_ac_11272.bin") + 1]
+            check(
+                flow.shown.get("step_id") == "ac_test"
+                and flow._ac_bin == expect_bin,
+                f"空调『自动试下一个』前进到下一型号（{expect_bin}）",
+            )
+        else:
+            check(flow.aborted == "test_exhausted", "无更多候选 -> abort(test_exhausted)")
+        # 回到 11272 再走一遍 ok
         await flow.async_step_ac_test({"test_result": "retry"})
-        check(flow.shown.get("step_id") == "ac_device", "空调『没反应』-> 退回 ac_device 步")
         await flow.async_step_ac_device({"device": "irda_new_ac_11272.bin"})
         infrared.STUB_SENT.clear()
         await flow.async_step_ac_test({"test_result": "ok"})
@@ -1603,9 +1967,11 @@ def check_ac() -> None:
             data["category"] == "ac"
             and data["brand"] == "美的"
             and data["device"] == "irda_new_ac_11272.bin"
+            and data["tx_type"] == "infrared"
+            and data["tx_target"] == EMITTER
             and data["emitter"] == EMITTER
             and data["carrier"] == 38000,
-            "AC entry data 完整（category=ac / brand / device bin / emitter / carrier）",
+            "AC entry data 完整（tx 通道 + emitter 别名 + category/brand/device bin/carrier）",
             f"实际 {data!r}",
         )
         check("11272" in created["title"], f"entry title 含型号编号（{created['title']!r}）")
@@ -1624,6 +1990,7 @@ def main() -> int:
     check_library()
     check_ir_command()
     check_remote_entity()
+    check_tx()
     check_config_flow()
     check_button_platform()
     check_services_yaml()
@@ -1640,7 +2007,7 @@ def main() -> int:
     #      + [10] button 平台 21 项        = 105
     #      + [11] services.yaml 4 项       = 109
     #      + [12] AC 码库 + climate 40 项  = 149  （ac_test 实测步 +4）
-    expected_total = 149
+    expected_total = 181
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(

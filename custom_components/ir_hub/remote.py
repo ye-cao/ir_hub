@@ -33,13 +33,19 @@ from .const import (
     CONF_DEVICE,
     CONF_EMITTER,
     CONF_REPEATS,
+    CONF_TX_DELAY,
+    CONF_TX_TARGET,
+    CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
     DEFAULT_REPEATS,
+    DEFAULT_TX_DELAY,
     DOMAIN,
+    TX_INFRARED,
 )
 from .ir_command import build_raw_command, parse_timings
 from .library import CodeLibrary
+from .transmitter import async_send_timings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,8 +115,17 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
         self._device_id = int(device["id"])
         self._keys = library.key_names(device)
 
-        # 这是给基类用的：基类靠它跟踪 emitter 可用性 / 发命令
-        self._infrared_emitter_entity_id: str = data[CONF_EMITTER]
+        # ---- 发射通道（infrared / esphome / broadlink / mqtt）----
+        # 旧条目只有 CONF_EMITTER ⇒ 兼容回退为 infrared + emitter 实体
+        self._tx_type: str = data.get(CONF_TX_TYPE) or TX_INFRARED
+        self._tx_target: str = (
+            data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
+        )
+        self._tx_delay: float = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
+
+        # 这是给基类用的：infrared 通道下基类靠它跟踪 emitter 可用性 / 发命令；
+        # 其它通道基类跟踪被 async_added_to_hass 跳过，发码也走 transmitter。
+        self._infrared_emitter_entity_id: str = self._tx_target
 
         self._carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
         self._repeats = max(1, int(data.get(CONF_REPEATS) or DEFAULT_REPEATS))
@@ -150,13 +165,36 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose what this remote can do (helps building dashboards)."""
         return {
-            "ir_hub_emitter": self._infrared_emitter_entity_id,
+            "ir_hub_tx_type": self._tx_type,
+            "ir_hub_tx_target": self._tx_target,
+            "ir_hub_emitter": self._tx_target if self._tx_type == TX_INFRARED else None,
             "ir_hub_carrier": self._carrier,
             "ir_hub_repeats": self._repeats,
             "ir_hub_category": self._library.categories.get(self._device["category"]),
             "ir_hub_protocol": self._device.get("protocol"),
             "ir_hub_key_count": len(self._keys),
         }
+
+    # ------------------------------------------------------------------ 发射通道
+
+    async def async_added_to_hass(self) -> None:
+        """infrared 通道跟随 emitter 可用性；其它通道无实体状态可跟，恒可用。"""
+        if self._tx_type == TX_INFRARED:
+            await super().async_added_to_hass()
+
+    async def _send_command(self, command) -> None:
+        """按通道路由：infrared 走 consumer 基类；其余由 transmitter 打包发服务。"""
+        if self._tx_type == TX_INFRARED:
+            await super()._send_command(command)
+            return
+        await async_send_timings(
+            self.hass,
+            self._tx_type,
+            self._tx_target,
+            command.get_raw_timings(),
+            carrier=command.modulation,
+            delay=self._tx_delay,
+        )
 
     # ------------------------------------------------------------------ 发送
 

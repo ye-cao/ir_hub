@@ -40,13 +40,19 @@ from .const import (
     CONF_DEVICE,
     CONF_EMITTER,
     CONF_REPEATS,
+    CONF_TX_DELAY,
+    CONF_TX_TARGET,
+    CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
     DEFAULT_REPEATS,
+    DEFAULT_TX_DELAY,
     DOMAIN,
+    TX_INFRARED,
 )
 from .ir_command import build_raw_command
 from .library import CodeLibrary
+from .transmitter import async_send_timings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,7 +109,14 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         model_short = model.removesuffix(".bin").replace("irda_new_ac_", "")
 
         self._code = code
-        self._infrared_emitter_entity_id: str = data[CONF_EMITTER]
+        # 发射通道（旧条目只有 CONF_EMITTER ⇒ 兼容回退为 infrared）
+        self._tx_type: str = data.get(CONF_TX_TYPE) or TX_INFRARED
+        self._tx_target: str = (
+            data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
+        )
+        self._tx_delay: float = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
+        # infrared 通道下基类靠它跟踪 emitter 可用性；其它通道不用
+        self._infrared_emitter_entity_id: str = self._tx_target
         self._carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
         self._repeats = max(1, int(data.get(CONF_REPEATS) or DEFAULT_REPEATS))
 
@@ -151,7 +164,13 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ 恢复
 
     async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
+        """infrared 通道先跟随 emitter 可用性，然后恢复状态。
+
+        ⚠️ RestoreEntity 的恢复走 `async_get_last_state()` 直接调用（不经过
+        super() 链）⇒ 非 infrared 通道跳过 super() 不会跳过恢复。
+        """
+        if self._tx_type == TX_INFRARED:
+            await super().async_added_to_hass()
         last = await self.async_get_last_state()
         if last is None:
             return
@@ -185,7 +204,9 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
-            "ir_hub_emitter": self._infrared_emitter_entity_id,
+            "ir_hub_tx_type": self._tx_type,
+            "ir_hub_tx_target": self._tx_target,
+            "ir_hub_emitter": self._tx_target if self._tx_type == TX_INFRARED else None,
             "ir_hub_carrier": self._carrier,
             "ir_hub_repeats": self._repeats,
             "ir_hub_model": self._attr_device_info["model_id"],
@@ -193,6 +214,22 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
                 self._last_on_operation.value if self._last_on_operation else None
             ),
         }
+
+    # ------------------------------------------------------------------ 发射通道
+
+    async def _send_command(self, command) -> None:
+        """按通道路由：infrared 走 consumer 基类；其余由 transmitter 打包发服务。"""
+        if self._tx_type == TX_INFRARED:
+            await super()._send_command(command)
+            return
+        await async_send_timings(
+            self.hass,
+            self._tx_type,
+            self._tx_target,
+            command.get_raw_timings(),
+            carrier=command.modulation,
+            delay=self._tx_delay,
+        )
 
     # ------------------------------------------------------------------ 设置
 

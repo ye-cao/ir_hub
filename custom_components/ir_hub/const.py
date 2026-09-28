@@ -30,3 +30,20 @@ CATEGORY_DATA_FILE = "data/%s.bin.gz"
 CATEGORY_AC = "ac"
 
 # 库里时序值里出现的"长 gap"（4 万~20 万 µs）由 varint 自然承载，无需特殊处理。
+
+# --------------------------------------------------------------- 发射通道
+# 对齐 SmartAC 的发射器抽象：不只 ESPHome infrared，还能走 Broadlink /
+# ESPHome 动作 / MQTT，让没有自制硬件的用户也能用现成发射器。
+CONF_TX_TYPE = "tx_type"
+CONF_TX_TARGET = "tx_target"
+CONF_TX_DELAY = "tx_delay"
+
+TX_INFRARED = "infrared"    # HA infrared emitter 实体（ESPHome ir_rf_proxy 等）
+TX_ESPHOME = "esphome"      # esphome.<动作> 服务，data {"command": [带符号时序]}（SmartAC 契约）
+TX_BROADLINK = "broadlink"  # remote.<实体>，b64 包（与 SmartAC raw2broadlink 逐字节一致）
+TX_MQTT = "mqtt"            # mqtt.publish，Tasmota IRMQTTServer RAW JSON
+
+TX_TYPES = (TX_INFRARED, TX_ESPHOME, TX_BROADLINK, TX_MQTT)
+
+# Broadlink `remote.send_command` 的 delay_secs（SmartAC 默认值，兼容沿用）
+DEFAULT_TX_DELAY = 0.5

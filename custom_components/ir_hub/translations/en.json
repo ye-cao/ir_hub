@@ -2,10 +2,17 @@
   "config": {
     "step": {
       "user": {
-        "title": "IR Hub — emitter and device type",
-        "description": "Bundled code library: {devices} remotes (generated {generated}).\n\nPick the infrared emitter that will transmit the codes (an ESPHome `ir_rf_proxy` entity), then the device category.",
+        "title": "IR Hub — Pick a transmitter type",
+        "description": "Bundled library: {devices} remotes + 1053 AC models.\n\nPick how frames get transmitted: a self-built ESPHome infrared emitter (recommended), an off-the-shelf Broadlink, an MQTT gateway running Tasmota IRMQTTServer, or any ESPHome action that accepts raw timings (SmartAC-compatible).",
         "data": {
-          "emitter": "Infrared emitter",
+          "tx_type": "Transmitter type"
+        }
+      },
+      "tx": {
+        "title": "IR Hub — Transmitter target & device type",
+        "description": "Channel: **{tx_type}**\nTarget: {tx_target_hint}\n\nThen pick the device category. After choosing brand/model a test frame is sent for confirmation.",
+        "data": {
+          "tx_target": "Transmitter target",
           "category": "Device category"
         }
       },
@@ -25,7 +32,7 @@
       },
       "test": {
         "title": "IR Hub — Test frame sent",
-        "description": "**A test frame (key: {key}) was just sent to {brand}.**\n\nWatch the device: if it reacted (power on / LED blink / action), pick \"It worked\" to finish; otherwise go back and pick another model — no throwaway entries. Choose \"Skip\" if you are not near the device.",
+        "description": "**A test frame (key: {key}) was just sent to {brand} ({index}/{total}: {model}).**\n\nWatch the device: if it reacted (power on / LED blink / action), pick \"It worked\" to finish; otherwise \"Try next model automatically\" (great for set-top boxes with many models) or go back and pick manually. Choose \"Skip\" if you are not near the device.",
         "data": {
           "test_result": "Did the device react?"
         }
@@ -46,7 +53,7 @@
       },
       "ac_test": {
         "title": "IR Hub — AC test frame sent",
-        "description": "**An OFF frame was just sent to {brand} (model {model}).**\n\nIf the AC beeped or powered down, pick \"It worked\" to finish; otherwise go back and pick another model. Choose \"Skip\" if you are not near the unit.",
+        "description": "**An OFF frame was just sent to {brand} ({index}/{total}: model {model}).**\n\nIf the AC beeped or powered down, pick \"It worked\" to finish; otherwise \"Try next model automatically\" or go back and pick manually. Choose \"Skip\" if you are not near the unit.",
         "data": {
           "test_result": "Did the AC react?"
         }
@@ -58,21 +65,25 @@
       "no_brands": "This category has no brands in the code library.",
       "no_devices": "This brand has no models in the code library.",
       "device_gone": "That model is no longer in the code library.",
-      "ac_decode_failed": "This model's code data failed to decode (corrupt irext data). Try another model."
+      "ac_decode_failed": "This model's code data failed to decode (corrupt irext data). Try another model.",
+      "test_exhausted": "Every model in this brand was tried with no reaction — check aim/line of sight, try another carrier (56k) in the options, or pick a different brand."
     },
     "error": {
       "send_failed": "Sending the test frame failed (emitter offline or refused). Retry later, skip the test, or go back.",
-      "no_test_key": "This model has no usable test code in the library. You can skip the test and finish anyway."
+      "no_test_key": "This model has no usable test code in the library. You can skip the test and finish anyway.",
+      "target_missing": "The transmitter target does not exist or is unavailable (entity offline / ESPHome action not registered / Broadlink entity missing). Check and retry.",
+      "mqtt_missing": "The MQTT integration is not loaded — configure an MQTT broker in HA first, then use the MQTT channel."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "IR Hub settings",
-        "description": "Settings for {title}.\n\nCarrier: most devices use 38000 Hz. Do NOT trust the protocol name in the library — if the device ignores the codes, try 56000 (or 40000) here.\nTransmit count: how many times the frame is sent per press (1 = once). RAISE this if the device only responds every other press.",
+        "description": "Settings for {title}.\n\nCarrier: most devices use 38000 Hz. Do NOT trust the protocol name in the library — if the device ignores the codes, try 56000 (or 40000) here.\nTransmit count: how many times the frame is sent per press (1 = once). RAISE this if the device only responds every other press.\nBroadlink delay: only used by the Broadlink channel (seconds between sends).",
         "data": {
           "carrier": "Carrier frequency (Hz)",
-          "repeats": "Transmit count"
+          "repeats": "Transmit count",
+          "tx_delay": "Broadlink delay (seconds)"
         }
       }
     }

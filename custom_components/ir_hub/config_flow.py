@@ -1,17 +1,18 @@
 """Config flow / Options flow for IR Hub.
 
 添加流程（四步表单）：
-    1. user    —— 选一个 infrared emitter（来自 ESPHome 的 ir_rf_proxy 实体）
-                  + 选设备大类（空调 / 电视机 / 机顶盒 / 风扇 …）
-    2. brand   —— 选品牌
-    3. device  —— 选型号
-    4. test    —— **发一帧实测码**（设备=power 键；空调=关机帧），用户确认
-                  设备有反应才建 entry；没反应退回第 3 步重选，不生成废 entry
+    1. user    —— 选**发射通道**（infrared / esphome / broadlink / mqtt，
+                  对齐 SmartAC 的发射器抽象，让没有自制硬件的用户也能用）
+    2. tx      —— 按通道填发射目标 + 选设备大类（空调 / 电视机 / 机顶盒 …）
+    3. brand   —— 选品牌
+    4. device  —— 选型号
+    5. test    —— **发一帧实测码**（设备=power 键；空调=关机帧），用户确认
+                  设备有反应才建 entry；没反应退回第 4 步重选，不生成废 entry
                   （对齐 SmartAC 的"测试通过才加入"体验）
 
 建完之后，`remote.<品牌>_<型号>`（或空调的 `climate.*`）就出现了；按键名即
-activity_list。载波频率与发送次数在 **选项** 里改（OptionsFlow）—— 因为
-"38k 还是 56k" 只能靠实测定，留个不用重加集成的开关很重要。
+activity_list。载波频率、发送次数、Broadlink delay 在 **选项** 里改
+（OptionsFlow）—— "38k 还是 56k" 只能靠实测定，留个不用重加集成的开关很重要。
 """
 
 from __future__ import annotations
@@ -33,13 +34,23 @@ from .const import (
     CONF_DEVICE,
     CONF_EMITTER,
     CONF_REPEATS,
+    CONF_TX_DELAY,
+    CONF_TX_TARGET,
+    CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
     DEFAULT_REPEATS,
+    DEFAULT_TX_DELAY,
     DOMAIN,
+    TX_BROADLINK,
+    TX_ESPHOME,
+    TX_INFRARED,
+    TX_MQTT,
+    TX_TYPES,
 )
 from .ir_command import build_raw_command
 from .library import CodeLibrary
+from .transmitter import async_send_timings, async_validate_target
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,44 +58,64 @@ _LOGGER = logging.getLogger(__name__)
 # "skip" 留给"人不在设备旁 / 发射器还没上电"的场合 —— 不强制。
 CONF_TEST_RESULT = "test_result"
 TEST_RETRY = "retry"
+TEST_NEXT = "next"
 TEST_RESULT_OPTIONS = {
     "ok": "有反应，完成添加",
+    "next": "没反应，自动试下一个型号",
     "retry": "没反应，退回重选型号",
     "skip": "跳过测试，直接添加",
 }
 
+# 发射通道下拉（value → 显示文本）
+TX_TYPE_OPTIONS = {
+    TX_INFRARED: "infrared 发射器（ESPHome ir_rf_proxy 等，推荐）",
+    TX_BROADLINK: "Broadlink（现成遥控宝，走 remote.send_command）",
+    TX_ESPHOME: "ESPHome 动作（SmartAC 兼容，如 esphome.xxx_send_raw_command）",
+    TX_MQTT: "MQTT（Tasmota IRMQTTServer，填 topic）",
+}
+
+# 各通道目标字段的表单提示（description_placeholders 用）
+_TX_TARGET_LABELS = {
+    TX_INFRARED: "下拉选择 infrared 发射器实体",
+    TX_ESPHOME: "如 esphome.ir_control_send_raw_command（或只写动作名）",
+    TX_BROADLINK: "下拉选择 Broadlink 的 remote 实体",
+    TX_MQTT: "如 tasmota_ir/cmnd/ir（Tasmota IRMQTTServer）",
+}
+
 
 class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Add one remote (码库设备 + emitter 的组合)。"""
+    """Add one remote (码库设备 + 发射通道的组合)。"""
 
     VERSION = 1
 
     def __init__(self) -> None:
-        self._emitter: str = ""
+        self._tx_type: str = TX_INFRARED
+        self._tx_target: str = ""
         self._category: int | str = 0
         self._brand: int = 0
         self._library: CodeLibrary | None = None
         self._ac_library: AcLibrary | None = None
         self._ac_brand: str = ""
         self._device_id: int = 0
+        self._key_candidates: list[int] = []   # 品牌内全部候选（"自动试下一个"用）
+        self._key_index: int = 0
         self._ac_bin: str = ""
+        self._ac_candidates: list[str] = []
+        self._ac_index: int = 0
         self._ac_code: dict | None = None
 
     # ------------------------------------------------------------------ 工具
 
     async def _async_send_test(self, timings: list[int]) -> None:
-        """把一帧测试码直接经所选 emitter 发出去（此刻还没有任何实体）。
-
-        `infrared.async_send_command(hass, emitter_entity_id, command)` 是
-        infrared building block 的公开 API —— consumer 实体的 `_send_command()`
-        底层走的也是它，config flow 阶段直接调它是合法路径。
-        """
-        command = build_raw_command(
-            timings, carrier=DEFAULT_CARRIER, repeats=DEFAULT_REPEATS
+        """把一帧测试码经**所选通道**发出去（此刻还没有任何实体）。"""
+        await async_send_timings(
+            self.hass,
+            self._tx_type,
+            self._tx_target,
+            timings,
+            carrier=DEFAULT_CARRIER,
+            delay=DEFAULT_TX_DELAY,
         )
-        await infrared.async_send_command(self.hass, self._emitter, command)
-
-    # ------------------------------------------------------------------ 工具
 
     async def _async_library(self) -> CodeLibrary:
         """码库是只读静态资源，config flow 里自己解一份即可（不会常驻）。"""
@@ -98,34 +129,16 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._ac_library = await self.hass.async_add_executor_job(AcLibrary)
         return self._ac_library
 
-    # ------------------------------------------------------------- 第 1 步
-
-    async def async_step_user(self, user_input: dict | None = None):
-        """选 emitter + 设备大类。"""
-        library = await self._async_library()
-        ac_library = await self._async_ac_library()
-
-        emitters = infrared.async_get_emitters(self.hass)
-        if not emitters:
-            # 没有可用的红外发射器就没必要往下走 —— 引导用户先把 ESPHome 配好
-            return self.async_abort(reason="no_emitters")
-
-        if user_input is not None:
-            self._emitter = user_input[CONF_EMITTER]
-            if user_input[CONF_CATEGORY] == CATEGORY_AC:
-                return await self.async_step_ac_brand()
-            self._category = int(user_input[CONF_CATEGORY])
-            return await self.async_step_brand()
-
+    def _async_category_schema(self) -> vol.Schema:
+        """设备大类下拉（含 AC 特殊项）—— 各通道表单共用。"""
+        library = self._library
+        assert library is not None
         categories = {
             str(cid): f"{name}（{count} 台）"
             for cid, name, count in library.categories_available()
         }
-        if not categories:
-            return self.async_abort(reason="empty_library")
-
-        # ⭐ 空调走**状态码库**（irext bin，233 品牌），产生真正的 climate 温控
-        #    面板 —— 放在第一位，因为这是家用场景里最常用的。
+        ac_library = self._ac_library
+        assert ac_library is not None
         categories = {
             CATEGORY_AC: (
                 f"空调 · 温控面板（{ac_library.brand_count} 品牌 / "
@@ -133,20 +146,88 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             **categories,
         }
+        return vol.Schema(
+            {
+                vol.Required(CONF_TX_TARGET): self._tx_target_validator(),
+                vol.Required(CONF_CATEGORY): vol.In(categories),
+            }
+        )
+
+    def _tx_target_validator(self):
+        """按通道生成目标字段的校验器。"""
+        if self._tx_type == TX_INFRARED:
+            emitters = infrared.async_get_emitters(self.hass)
+            return vol.In(emitters)
+        if self._tx_type == TX_BROADLINK:
+            remotes = sorted(
+                state.entity_id
+                for state in self.hass.states.async_all("remote")
+            )
+            return vol.In(remotes)
+        # esphome / mqtt：自由文本
+        return str
+
+    # ------------------------------------------------------------- 第 1 步
+
+    async def async_step_user(self, user_input: dict | None = None):
+        """选发射通道。"""
+        await self._async_library()
+        await self._async_ac_library()
+
+        if user_input is not None:
+            self._tx_type = user_input[CONF_TX_TYPE]
+            return await self.async_step_tx()
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_EMITTER): vol.In(emitters),
-                    vol.Required(CONF_CATEGORY): vol.In(categories),
-                }
+                {vol.Required(CONF_TX_TYPE, default=TX_INFRARED): vol.In(TX_TYPE_OPTIONS)}
             ),
             description_placeholders={
-                "devices": str(len(library.devices)),
-                "generated": library.generated or "未知",
+                "devices": str(len((await self._async_library()).devices))
             },
         )
+
+    async def async_step_tx(self, user_input: dict | None = None):
+        """按通道填发射目标 + 选设备大类。"""
+        library = await self._async_library()
+
+        # infrared 通道且没有 emitter ⇒ 提前引导（别的通道不依赖 infrared）
+        if self._tx_type == TX_INFRARED and user_input is None:
+            if not infrared.async_get_emitters(self.hass):
+                return self.async_abort(reason="no_emitters")
+
+        if user_input is not None:
+            self._tx_target = str(user_input[CONF_TX_TARGET]).strip()
+            error = await async_validate_target(
+                self.hass, self._tx_type, self._tx_target
+            )
+            if error is not None:
+                return self.async_show_form(
+                    step_id="tx",
+                    data_schema=self._async_category_schema(),
+                    errors={"base": error},
+                    description_placeholders=self._tx_placeholders(library),
+                )
+            if user_input[CONF_CATEGORY] == CATEGORY_AC:
+                self._category = CATEGORY_AC
+                return await self.async_step_ac_brand()
+            self._category = int(user_input[CONF_CATEGORY])
+            return await self.async_step_brand()
+
+        return self.async_show_form(
+            step_id="tx",
+            data_schema=self._async_category_schema(),
+            description_placeholders=self._tx_placeholders(library),
+        )
+
+    def _tx_placeholders(self, library: CodeLibrary) -> dict[str, str]:
+        return {
+            "tx_type": dict(TX_TYPE_OPTIONS).get(self._tx_type, self._tx_type),
+            "tx_target_hint": _TX_TARGET_LABELS.get(self._tx_type, ""),
+            "devices": str(len(library.devices)),
+            "generated": library.generated or "未知",
+        }
 
     # ------------------------------------------------------------- 第 2 步
 
@@ -177,7 +258,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # ------------------------------------------------------------- 第 3 步
 
     async def async_step_device(self, user_input: dict | None = None):
-        """选型号并建 entry。"""
+        """选型号。"""
         library = await self._async_library()
         brand_name = library.brands.get(self._brand) or f"品牌 {self._brand}"
 
@@ -188,7 +269,14 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_abort(reason="device_gone")
             # ⭐ 不直接建 entry —— 先去 test 步发一帧实测码，确认设备有反应
             #    再落库，避免"加错了删掉重来"。
+            #    同时记下品牌内全部候选：test 步"没反应"可以自动试下一个型号。
             self._device_id = device_id
+            self._key_candidates = [int(d["id"]) for d in library.devices_in(self._category, self._brand)]
+            self._key_index = (
+                self._key_candidates.index(device_id)
+                if device_id in self._key_candidates
+                else 0
+            )
             return await self.async_step_test()
 
         devices: dict[str, str] = {}
@@ -220,18 +308,31 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         对齐 SmartAC 的体验：码库选型只是"候选"，**设备真响应了才算数**。
         测试键取 power（key_names 已把 power 排第一），没有 power 就取
-        第一个可用键。
+        第一个可用键。"next" = 自动前进到品牌内下一个型号再发（机顶盒这类
+        型号多的品牌不用逐个回下拉重选）。
         """
         library = await self._async_library()
-        device = library.get_device(self._device_id)
-        if device is None:
-            return self.async_abort(reason="device_gone")
         brand_name = library.brands.get(self._brand) or f"品牌 {self._brand}"
 
         if user_input is not None:
-            if user_input[CONF_TEST_RESULT] == TEST_RETRY:
+            result = user_input[CONF_TEST_RESULT]
+            if result == TEST_RETRY:
                 return await self.async_step_device()
-            return self._async_finish_device(library, device)
+            if result == TEST_NEXT:
+                nxt = self._key_index + 1
+                if nxt >= len(self._key_candidates):
+                    return self.async_abort(reason="test_exhausted")
+                self._key_index = nxt
+                self._device_id = self._key_candidates[nxt]
+            else:  # ok / skip
+                device = library.get_device(self._device_id)
+                if device is None:
+                    return self.async_abort(reason="device_gone")
+                return self._async_finish_device(library, device)
+
+        device = library.get_device(self._device_id)
+        if device is None:
+            return self.async_abort(reason="device_gone")
 
         errors: dict[str, str] = {}
         keys = library.key_names(device)
@@ -242,8 +343,8 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         else:
             try:
                 await self._async_send_test(timings)
-            except Exception:  # noqa: BLE001 —— emitter 掉线/拒发都必须落到表单
-                _LOGGER.exception("IR Hub: 测试码发送失败（emitter=%s）", self._emitter)
+            except Exception:  # noqa: BLE001 —— 发射器掉线/拒发都必须落到表单
+                _LOGGER.exception("IR Hub: 测试码发送失败（%s/%s）", self._tx_type, self._tx_target)
                 errors["base"] = "send_failed"
 
         return self.async_show_form(
@@ -252,7 +353,13 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {vol.Required(CONF_TEST_RESULT): vol.In(TEST_RESULT_OPTIONS)}
             ),
             errors=errors or None,
-            description_placeholders={"brand": brand_name, "key": key or "—"},
+            description_placeholders={
+                "brand": brand_name,
+                "model": device["name"],
+                "index": str(self._key_index + 1),
+                "total": str(max(len(self._key_candidates), 1)),
+                "key": key or "—",
+            },
         )
 
     def _async_finish_device(self, library: CodeLibrary, device: dict):
@@ -260,15 +367,31 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         brand_name = library.brands.get(self._brand) or f"品牌 {self._brand}"
         return self.async_create_entry(
             title=library.display_name(brand_name, device["name"]),
-            data={
-                CONF_EMITTER: self._emitter,
-                CONF_CATEGORY: self._category,
-                CONF_BRAND: self._brand,
-                CONF_DEVICE: int(device["id"]),
-                CONF_CARRIER: DEFAULT_CARRIER,
-                CONF_REPEATS: DEFAULT_REPEATS,
-            },
+            data=self._entry_data(),
         )
+
+    def _entry_data(self) -> dict:
+        """entry.data 公共部分：发射通道 + 载波 + 次数。
+
+        infrared 通道额外写一份 CONF_EMITTER（兼容旧字段/旧脚本）。
+        """
+        data = {
+            CONF_TX_TYPE: self._tx_type,
+            CONF_TX_TARGET: self._tx_target,
+            CONF_CARRIER: DEFAULT_CARRIER,
+            CONF_REPEATS: DEFAULT_REPEATS,
+        }
+        if self._category == CATEGORY_AC:
+            data[CONF_CATEGORY] = CATEGORY_AC
+            data[CONF_BRAND] = self._ac_brand
+            data[CONF_DEVICE] = self._ac_bin
+        else:
+            data[CONF_CATEGORY] = self._category
+            data[CONF_BRAND] = self._brand
+            data[CONF_DEVICE] = self._device_id
+        if self._tx_type == TX_INFRARED:
+            data[CONF_EMITTER] = self._tx_target
+        return data
 
     # ------------------------------------------------------- AC 专用步骤
 
@@ -311,9 +434,18 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._ac_code = await self.hass.async_add_executor_job(
                     ac_library.load_device, bin_name
                 )
-            except (OSError, ValueError) as err:
+            except (OSError, ValueError):
                 return self.async_abort(reason="ac_decode_failed")
             self._ac_bin = bin_name
+            # 品牌内全部候选（"自动试下一个"用），顺序与下拉一致
+            self._ac_candidates = [
+                d["bin"] for d in ac_library.devices_in(self._ac_brand)
+            ]
+            self._ac_index = (
+                self._ac_candidates.index(bin_name)
+                if bin_name in self._ac_candidates
+                else 0
+            )
             return await self.async_step_ac_test()
 
         devices = {
@@ -341,9 +473,23 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         ac_library = await self._async_ac_library()
 
         if user_input is not None:
-            if user_input[CONF_TEST_RESULT] == TEST_RETRY:
+            result = user_input[CONF_TEST_RESULT]
+            if result == TEST_RETRY:
                 return await self.async_step_ac_device()
-            return self._async_finish_ac(ac_library)
+            if result == TEST_NEXT:
+                nxt = self._ac_index + 1
+                if nxt >= len(self._ac_candidates):
+                    return self.async_abort(reason="test_exhausted")
+                self._ac_index = nxt
+                self._ac_bin = self._ac_candidates[nxt]
+                try:
+                    self._ac_code = await self.hass.async_add_executor_job(
+                        ac_library.load_device, self._ac_bin
+                    )
+                except (OSError, ValueError):
+                    return self.async_abort(reason="ac_decode_failed")
+            else:  # ok / skip
+                return self._async_finish_ac(ac_library)
 
         errors: dict[str, str] = {}
         timings = (self._ac_code or {}).get("off") or []
@@ -352,8 +498,8 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "no_test_key"
             else:
                 await self._async_send_test(timings)
-        except Exception:  # noqa: BLE001 —— emitter 掉线/拒发都必须落到表单
-            _LOGGER.exception("IR Hub: 空调测试码发送失败（emitter=%s）", self._emitter)
+        except Exception:  # noqa: BLE001 —— 发射器掉线/拒发都必须落到表单
+            _LOGGER.exception("IR Hub: 空调测试码发送失败（%s/%s）", self._tx_type, self._tx_target)
             errors["base"] = "send_failed"
 
         model_short = self._ac_bin.removesuffix(".bin").replace("irda_new_ac_", "")
@@ -366,6 +512,8 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "brand": self._ac_brand,
                 "model": model_short,
+                "index": str(self._ac_index + 1),
+                "total": str(max(len(self._ac_candidates), 1)),
             },
         )
 
@@ -377,14 +525,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return self.async_create_entry(
             title=title,
-            data={
-                CONF_EMITTER: self._emitter,
-                CONF_CATEGORY: CATEGORY_AC,
-                CONF_BRAND: self._ac_brand,
-                CONF_DEVICE: self._ac_bin,
-                CONF_CARRIER: DEFAULT_CARRIER,
-                CONF_REPEATS: DEFAULT_REPEATS,
-            },
+            data=self._entry_data(),
         )
 
     # ------------------------------------------------------------- 选项
@@ -396,7 +537,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class IrHubOptionsFlow(config_entries.OptionsFlow):
-    """只暴露两个真正需要调的旋钮：载波频率、发送次数。"""
+    """载波频率、发送次数、Broadlink delay —— 真正需要调的三个旋钮。"""
 
     async def async_step_init(self, user_input: dict | None = None):
         if user_input is not None:
@@ -417,6 +558,10 @@ class IrHubOptionsFlow(config_entries.OptionsFlow):
                         CONF_REPEATS,
                         default=int(current.get(CONF_REPEATS) or DEFAULT_REPEATS),
                     ): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
+                    vol.Required(
+                        CONF_TX_DELAY,
+                        default=float(current.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY),
+                    ): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
                 }
             ),
             description_placeholders={"title": entry.title},
