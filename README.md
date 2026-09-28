@@ -12,7 +12,7 @@ IR Hub 实体 ─ infrared.async_send_command ─ infrared.<emitter> 实体
 
 | | 码库 | 实体 |
 |---|---|---|
-| **电视 / 机顶盒 / 风扇…** | irext 按键码库：8,565 设备 / 1,259 品牌 / 153,025 键 | 每设备 1 个 `remote.*` + 每键 1 个 `button.*` |
+| **电视 / 机顶盒 / 风扇…** | irext 按键码库：**13,615 设备**（collect 8,565 + 官网 decode 5,050，0.3.6 起与官网 1:1）/ 1,259 品牌 / 258,653 键 | 每设备 1 个 `remote.*` + 每键 1 个 `button.*` |
 | **⭐ 空调** | irext 状态码库：525 bin / **245 品牌 / 1507 型号**（美的/格力/TCL/海尔…全在；0.3.5 起与官网 remote_index 全量对齐，美的 18→26） | 每型号 1 个 `climate.*` 恒温器面板 |
 
 空调是真恒温器：模式 / 温度滑条 / 风速原生可调，重启自动恢复状态，
@@ -140,10 +140,12 @@ data:
 
 - 双数据源（0.3.4 起）：**collect 路径**（collect_remote × collect_key，用户上传采集码，中文名）
   + **decode 路径**（remote_index × decode_remote，官方解码库 = 官网 code 页的"控制码"，
-  英文名如 `remote_iptv_dxmh`，设备 id = 索引 id + 100000）。同 (大类， 品牌) 下
-  「键名集合 + 全键值 md5」签名一致视为同一遥控，decode 与 collect 重复的 1,848 个不入库。
+  英文名如 `remote_iptv_dxmh`，设备 id = 索引 id + 100000）。
+  **0.3.6 起按官网基准 1:1**：remote_index 每行独立成条，不再做签名去重
+  （此前 1,848 条重复被合并，品牌下型号数与官网对不上）；重复条目信号
+  逐值相同，gzip 仅 +0.4 MB。
 - 按键库已清理：剔除占位键 30,065 / 重复键 2,998（判据由 `tools/selfcheck.py` 守着）。
-  存储 4.21 MB gzip 按类别分块（16 类），运行时只解压用到的一块。**IPTV（电信魔盒等
+  存储 4.62 MB gzip 按类别分块（16 类），运行时只解压用到的一块。**IPTV（电信魔盒等
   运营商盒子）在「IPTV」大类**，此前整类缺失 0.3.4 已补全。
   - 空调状态码库 525 bin（0.3.5 起按官方 irext-binaries 全量对齐；官方 zip 中 22 个损坏 bin 已剔除）在 `ac_library/`，解码器移植自
   [SmartAC](https://github.com/ryanh7/SmartAC)（irext 官方 `ir_decode.c` 的 Python 移植，MIT）。
@@ -158,7 +160,7 @@ data:
 python tools/selfcheck.py
 ```
 
-**140 项**：全库每键 varint 逐字节往返（不抽样）、符号交替不变式、AC 全库
+**189 项**：全库每键 varint 逐字节往返（不抽样）、符号交替不变式、AC 全库
 525 bin 全量解码回归（0 失败）、remote/button/climate/config_flow 真逻辑单测
 （stub homeassistant）、翻译键与 flow 的一致性。末尾 `expected_total` 护栏
 保证没有任何检查段被静默跳过。发布形态下 2 项需要仓库外文件的检查自动跳过。
