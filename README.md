@@ -18,6 +18,10 @@ IR Hub 实体 ─ infrared.async_send_command ─ infrared.<emitter> 实体
 空调是真恒温器：模式 / 温度滑条 / 风速原生可调，重启自动恢复状态，
 **不需要 SmartIR / SmartAC**。载波 / 发送次数在集成「选项」里改，改完立即生效。
 
+[![HACS](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
+**一键添加到 HACS**：装好 HACS 的 HA 点这里 →
+[HACS 安装 ir_hub](https://my.home-assistant.io/redirect/hacs_repository/?owner=ye-cao&repository=ir_hub&category=integration)
+
 ## 依赖
 
 | 项 | 要求 |
@@ -42,10 +46,26 @@ infrared:
 
 ## 安装
 
-**HACS**：自定义仓库 → Integration → `ye-cao/ir_hub`。
+### 方式一：HACS（推荐）
 
-**手动**：把 `custom_components/ir_hub/` 放进 `config/custom_components/`，重启 HA，
-设置 → 设备与服务 → 添加集成 → **IR Hub**。
+1. HA 里先装好 [HACS](https://hacs.xyz) 本身（设置 → 设备与服务 → HACS，首次会要求授权 GitHub）。
+2. 添加本仓库，二选一：
+   - **点这个链接直达**（需已配置 My Home Assistant）：
+     [HACS 添加 ir_hub](https://my.home-assistant.io/redirect/hacs_repository/?owner=ye-cao&repository=ir_hub&category=integration)
+   - 或手动：**HACS → 右下角「自定义存储库」** → 仓库填 `ye-cao/ir_hub`、类别选 **Integration** → 添加 → 点 **下载**。
+3. 重启 Home Assistant。
+4. 设置 → 设备与服务 → 添加集成 → 搜 **IR Hub**。
+
+> 之后有新版本，HACS 页面会出现更新提示，点更新 + 重启即可。
+
+### 方式二：离线安装
+
+1. 下载仓库（Code → Download ZIP，或 `git clone https://github.com/ye-cao/ir_hub.git`）。
+2. 把其中的 `custom_components/ir_hub/` **整个目录**拷到 HA 的
+   `config/custom_components/ir_hub/`（最终结构：`config/custom_components/ir_hub/manifest.json` 存在）。
+3. 重启 Home Assistant → 添加集成 → 搜 **IR Hub**。
+
+> HA 在容器/虚拟机里跑的，注意把目录拷进**容器内**的 `/config`（Samba / File editor 插件均可）。
 
 添加流程：选发射器 + 大类 →（空调：品牌 → 型号；其它：品牌 → 型号）→ 完成。
 
