@@ -1,0 +1,32 @@
+"""Constants for the IR Hub integration."""
+
+DOMAIN = "ir_hub"
+
+CONF_EMITTER = "emitter"
+CONF_CATEGORY = "category"
+CONF_BRAND = "brand"
+CONF_DEVICE = "device"
+CONF_CARRIER = "carrier"
+CONF_REPEATS = "repeats"
+
+# 绝大多数家电是 38 kHz。注意：**以实测为准**，不要相信 irext 的协议名
+# （本机 TCL 电视协议标 "RCA (56K)"，但实测 38 kHz 才管用）。
+DEFAULT_CARRIER = 38000
+
+# 发送次数（1 = 只发一次）。
+# ⚠️ 语义提醒：HA 的 esphome emitter（components/esphome/infrared.py）只把
+#    timings 和 modulation 透传给设备，**Command.repeat_count 会被丢弃**
+#    （protobuf 的 repeat_count 走默认值 1）⇒ "多送几次"只能靠复制时序实现，
+#    见 ir_command.build_raw_command()。
+DEFAULT_REPEATS = 1
+
+SERVICE_SEND_RAW = "send_raw"
+
+# library/data/<category_id>.bin.gz
+CATEGORY_DATA_FILE = "data/%s.bin.gz"
+
+# 空调条目的特殊"大类"标记：走 ac_library/（irext 状态码 bin）而非按键式码库，
+# 平台路由也不同（climate，而不是 remote/button）。存进 entry.data[CONF_CATEGORY]。
+CATEGORY_AC = "ac"
+
+# 库里时序值里出现的"长 gap"（4 万~20 万 µs）由 varint 自然承载，无需特殊处理。

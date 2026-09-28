@@ -1,0 +1,6 @@
+{
+  "name": "IR Hub",
+  "render_readme": true,
+  "homeassistant": "2026.6.0",
+  "zip_release": false
+}

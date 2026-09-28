@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "IR Hub — emitter and device type",
+        "description": "Bundled code library: {devices} remotes (generated {generated}).\n\nPick the infrared emitter that will transmit the codes (an ESPHome `ir_rf_proxy` entity), then the device category.",
+        "data": {
+          "emitter": "Infrared emitter",
+          "category": "Device category"
+        }
+      },
+      "brand": {
+        "title": "IR Hub — brand",
+        "description": "Category: {category} — {count} brands have codes here (busiest first).",
+        "data": {
+          "brand": "Brand"
+        }
+      },
+      "device": {
+        "title": "IR Hub — model",
+        "description": "{brand} — {count} models. The protocol hint is informational only: the real carrier is often different, so test 38 kHz first.",
+        "data": {
+          "device": "Model"
+        }
+      },
+      "ac_brand": {
+        "title": "IR Hub — Pick an AC brand",
+        "description": "Air conditioners use the irext state-code library ({count} brands / {devices} models).\n\nYou will get a **real thermostat panel** (native mode/temperature/fan controls) — no SmartIR/SmartAC needed.",
+        "data": {
+          "brand": "Brand"
+        }
+      },
+      "ac_device": {
+        "title": "IR Hub — Pick an AC model",
+        "description": "{brand} — {count} models (numbers from the irext library).\n\nIf some commands don't work, try a different carrier frequency in the integration options.",
+        "data": {
+          "device": "Model"
+        }
+      }
+    },
+    "abort": {
+      "no_emitters": "No infrared emitter found. Add an ESPHome device with an `infrared:` entity (platform `ir_rf_proxy`) first, then reload this integration.",
+      "empty_library": "The bundled code library is empty or unreadable.",
+      "no_brands": "This category has no brands in the code library.",
+      "no_devices": "This brand has no models in the code library.",
+      "device_gone": "That model is no longer in the code library.",
+      "ac_decode_failed": "This model's code data failed to decode (corrupt irext data). Try another model."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "IR Hub settings",
+        "description": "Settings for {title}.\n\nCarrier: most devices use 38000 Hz. Do NOT trust the protocol name in the library — if the device ignores the codes, try 56000 (or 40000) here.\nTransmit count: how many times the frame is sent per press (1 = once). RAISE this if the device only responds every other press.",
+        "data": {
+          "carrier": "Carrier frequency (Hz)",
+          "repeats": "Transmit count"
+        }
+      }
+    }
+  }
+}

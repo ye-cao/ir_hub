@@ -1,0 +1,50 @@
+# 服务元数据 —— 让 HA 的「开发者工具 → 操作」界面把字段渲染成中文标签 + 合适的选择器，
+# 而不是只显示原始的键名（emitter / timings / carrier / repeats）。
+#
+# 注：本文件只影响 UI 展示，不参与参数校验 —— 真正的校验在 __init__.py 的 SEND_RAW_SCHEMA。
+
+send_raw:
+  name: 发送裸时序
+  description: >-
+    绕过码库，直接把一段红外时序交给指定的 emitter 发出去。
+    用于「码库里没有的键」或调试。日常遥控请用 remote.send_command / button 实体。
+  fields:
+    emitter:
+      name: 红外发射器
+      description: 目标 emitter 实体（本机是 infrared.ir_control_ir_transmitter）
+      required: true
+      selector:
+        entity:
+          domain: infrared
+    timings:
+      name: 时序
+      description: >-
+        带符号的微秒时序：正数 = 载波开（mark），负数 = 空闲（space）。
+        既可传字符串 "3963 -3985 491 -1990"，也可传列表 [3963, -3985, 491, -1990]。
+      required: true
+      selector:
+        text:
+          multiline: true
+    carrier:
+      name: 载波频率
+      description: 单位 Hz。多数家电是 38000；本机 TCL 电视实测 38 kHz 有效、56 kHz 无效。
+      default: 38000
+      selector:
+        number:
+          min: 20000
+          max: 60000
+          step: 1000
+          unit_of_measurement: Hz
+          mode: box
+    repeats:
+      name: 发送次数
+      description: >-
+        复制整个帧的次数，1 = 只发一次。
+        （注意：HA 的 esphome emitter 会丢弃 Command.repeat_count，
+        所以这里是靠复制时序实现的。）
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 50
+          mode: box
