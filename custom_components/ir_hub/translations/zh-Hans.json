@@ -51,11 +51,18 @@
           "device": "型号"
         }
       },
+      "ac_test_on": {
+        "title": "IR Hub — 发送空调开机测试码",
+        "description": "**已向 {brand}（第 {index}/{total} 个：型号 {model}）发送一帧开机码（26°C / 自动风）**。\n\n空调有「滴」一声或开始出风就选「有反应」，接着会再发一帧关机码做二次确认；没反应可「自动试下一个型号」或退回重选；人不在旁可「跳过」。",
+        "data": {
+          "test_result": "空调开机了吗？"
+        }
+      },
       "ac_test": {
-        "title": "IR Hub — 发送空调测试码",
+        "title": "IR Hub — 发送空调关机测试码",
         "description": "**已向 {brand}（第 {index}/{total} 个：型号 {model}）发送一帧关机码**。\n\n空调有「滴」一声或关机反应就选「有反应」完成添加；没反应可以「自动试下一个型号」或退回重选。人不在空调旁可选「跳过」。",
         "data": {
-          "test_result": "空调有反应吗？"
+          "test_result": "空调关机了吗？"
         }
       }
     },

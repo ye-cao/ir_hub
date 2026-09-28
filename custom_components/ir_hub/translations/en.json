@@ -51,11 +51,18 @@
           "device": "Model"
         }
       },
+      "ac_test_on": {
+        "title": "IR Hub — AC power-ON test frame sent",
+        "description": "**An ON frame (26°C / auto fan) was just sent to {brand} ({index}/{total}: model {model}).**\n\nIf the AC beeped or started blowing, pick \"It worked\" — an OFF frame follows for a second confirmation; otherwise \"Try next model automatically\" or go back and pick manually. Choose \"Skip\" if you are not near the unit.",
+        "data": {
+          "test_result": "Did the AC turn ON?"
+        }
+      },
       "ac_test": {
-        "title": "IR Hub — AC test frame sent",
+        "title": "IR Hub — AC power-OFF test frame sent",
         "description": "**An OFF frame was just sent to {brand} ({index}/{total}: model {model}).**\n\nIf the AC beeped or powered down, pick \"It worked\" to finish; otherwise \"Try next model automatically\" or go back and pick manually. Choose \"Skip\" if you are not near the unit.",
         "data": {
-          "test_result": "Did the AC react?"
+          "test_result": "Did the AC turn OFF?"
         }
       }
     },

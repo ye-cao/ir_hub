@@ -60,13 +60,22 @@ _LOGGER = logging.getLogger(__name__)
 # 实测确认步的下拉选项（`vol.In(字典)`：key 是提交值，value 是显示文本）。
 # "skip" 留给"人不在设备旁 / 发射器还没上电"的场合 —— 不强制。
 CONF_TEST_RESULT = "test_result"
+TEST_OK = "ok"
 TEST_RETRY = "retry"
 TEST_NEXT = "next"
+TEST_SKIP = "skip"
 TEST_RESULT_OPTIONS = {
-    "ok": "有反应，完成添加",
-    "next": "没反应，自动试下一个型号",
-    "retry": "没反应，退回重选型号",
-    "skip": "跳过测试，直接添加",
+    TEST_OK: "有反应，完成添加",
+    TEST_NEXT: "没反应，自动试下一个型号",
+    TEST_RETRY: "没反应，退回重选型号",
+    TEST_SKIP: "跳过测试，直接添加",
+}
+# 空调两段式实测的第一段（开机帧）：ok 只是"继续"，还没建 entry
+AC_TEST_ON_OPTIONS = {
+    TEST_OK: "有反应（空调开机了），继续关机确认",
+    TEST_NEXT: "没反应，自动试下一个型号",
+    TEST_RETRY: "没反应，退回重选型号",
+    TEST_SKIP: "跳过这一步",
 }
 
 # 发射通道下拉（value → 显示文本）
@@ -449,7 +458,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if bin_name in self._ac_candidates
                 else 0
             )
-            return await self.async_step_ac_test()
+            return await self.async_step_ac_test_on()
 
         devices = {
             dev["bin"]: f"型号 {dev['device_name']}"
@@ -467,11 +476,81 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-    async def async_step_ac_test(self, user_input: dict | None = None):
-        """空调分支的实测步：发一帧**关机码**，确认空调有反应再建 entry。
+    def _ac_on_frame(self) -> list[int]:
+        """开机实测帧：mode/fan 优先 auto、温度优先 26（SmartAC async_test 同款选择）。"""
+        commands = (self._ac_code or {}).get("commands") or {}
+        if not commands:
+            return []
+        mode_key = "auto" if "auto" in commands else next(iter(commands))
+        fans = commands[mode_key]
+        fan_key = "auto" if "auto" in fans else next(iter(fans))
+        temps = fans[fan_key]
+        temp_key = "26" if "26" in temps else next(iter(temps))
+        return list(temps[temp_key])
 
-        为什么发 off 而不是开机：开机帧需要"模式×风速×温度"全组合才有意义，
-        而 off 是独立一帧、对所有空调语义唯一（滴一声/关机）—— 测试信号最干净。
+    async def async_step_ac_test_on(self, user_input: dict | None = None):
+        """空调实测第一段：发**开机帧**，确认空调有反应。
+
+        ⚠️ 为什么要两段（09-28 用户实测教训）：只发关机帧时，空调**本来就关着**
+        ⇒ 毫无可见反应，用户无从判断发射链路好坏。SmartAC 是开机→关机两段确认，
+        这里对齐。第二段（关机帧）在 async_step_ac_test。
+        """
+        ac_library = await self._async_ac_library()
+
+        if user_input is not None:
+            result = user_input[CONF_TEST_RESULT]
+            if result == TEST_RETRY:
+                return await self.async_step_ac_device()
+            if result == TEST_NEXT:
+                nxt = self._ac_index + 1
+                if nxt >= len(self._ac_candidates):
+                    return self.async_abort(reason="test_exhausted")
+                self._ac_index = nxt
+                self._ac_bin = self._ac_candidates[nxt]
+                try:
+                    self._ac_code = await self.hass.async_add_executor_job(
+                        ac_library.load_device, self._ac_bin
+                    )
+                except (OSError, ValueError):
+                    return self.async_abort(reason="ac_decode_failed")
+            elif result == TEST_OK:
+                return await self.async_step_ac_test()
+            else:  # skip —— 直接进第二段（关机确认）
+                return await self.async_step_ac_test()
+            # next：落到下面用新 bin 重发开机帧
+
+        errors: dict[str, str] = {}
+        timings = self._ac_on_frame()
+        try:
+            if not timings:
+                errors["base"] = "no_test_key"
+            else:
+                await self._async_send_test(timings)
+        except Exception:  # noqa: BLE001 —— 发射器掉线/拒发都必须落到表单
+            _LOGGER.exception(
+                "IR Hub: 空调开机帧发送失败（%s/%s）", self._tx_type, self._tx_target
+            )
+            errors["base"] = "send_failed"
+
+        model_short = self._ac_bin.removesuffix(".bin").replace("irda_new_ac_", "")
+        return self.async_show_form(
+            step_id="ac_test_on",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_TEST_RESULT): vol.In(AC_TEST_ON_OPTIONS)}
+            ),
+            errors=errors or None,
+            description_placeholders={
+                "brand": self._ac_brand,
+                "model": model_short,
+                "index": str(self._ac_index + 1),
+                "total": str(max(len(self._ac_candidates), 1)),
+            },
+        )
+
+    async def async_step_ac_test(self, user_input: dict | None = None):
+        """空调实测第二段：发一帧**关机码**，确认后才建 entry。
+
+        第一段（开机帧）见 async_step_ac_test_on —— 两段都确认，对齐 SmartAC。
         """
         ac_library = await self._async_ac_library()
 

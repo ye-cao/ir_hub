@@ -1969,13 +1969,41 @@ def check_ac() -> None:
         )
         await flow.async_step_ac_device({"device": "irda_new_ac_11272.bin"})
         check(
+            flow.shown.get("step_id") == "ac_test_on",
+            "选完空调型号 -> 进 ac_test_on 步（两段式第一段：发开机帧）",
+        )
+        check(
+            len(infrared.STUB_SENT) == 1 and infrared.STUB_SENT[0][0] == EMITTER,
+            "ac_test_on 立即发出一帧开机测试码",
+            f"实际 {infrared.STUB_SENT!r}",
+        )
+        on_timings = infrared.STUB_SENT[0][1].get_raw_timings()
+        check(
+            len(on_timings) >= 2 and any(t < 0 for t in on_timings),
+            f"开机帧非空且带符号（{len(on_timings)} 个时序值）",
+        )
+        # 开机帧选帧逻辑 = SmartAC async_test：mode/fan 优先 auto，温度优先 26、
+        # 否则取第一个（11272 的 auto 模式只有 17~24 ⇒ 实发 auto/auto/17）
+        ac_code = flow._ac_code
+        _m = "auto" if "auto" in ac_code["commands"] else next(iter(ac_code["commands"]))
+        _f = "auto" if "auto" in ac_code["commands"][_m] else next(iter(ac_code["commands"][_m]))
+        _t = ac_code["commands"][_m][_f]
+        _k = "26" if "26" in _t else next(iter(_t))
+        expect_on = _t[_k]
+        check(
+            on_timings == expect_on,
+            f"开机帧 = {_m}/{_f}/{_k}°C（对齐 SmartAC async_test 选帧逻辑）",
+        )
+        # 有反应 -> 进第二段（关机帧）
+        infrared.STUB_SENT.clear()
+        await flow.async_step_ac_test_on({"test_result": "ok"})
+        check(
             flow.shown.get("step_id") == "ac_test",
-            "选完空调型号 -> 进 ac_test 步（发关机实测帧）",
+            "开机确认 -> 进 ac_test 步（第二段：发关机帧）",
         )
         check(
             len(infrared.STUB_SENT) == 1 and infrared.STUB_SENT[0][0] == EMITTER,
             "ac_test 立即发出一帧关机测试码",
-            f"实际 {infrared.STUB_SENT!r}",
         )
         ac_timings = infrared.STUB_SENT[0][1].get_raw_timings()
         check(
@@ -1994,10 +2022,23 @@ def check_ac() -> None:
             )
         else:
             check(flow.aborted == "test_exhausted", "无更多候选 -> abort(test_exhausted)")
-        # 回到 11272 再走一遍 ok
-        await flow.async_step_ac_test({"test_result": "retry"})
+        # 开机段也能 next（在当前候选上继续前进并重发开机帧）
+        infrared.STUB_SENT.clear()
+        await flow.async_step_ac_test_on({"test_result": "next"})
+        if ac_bins.index(expect_bin) + 1 < len(ac_bins):
+            expect_bin2 = ac_bins[ac_bins.index(expect_bin) + 1]
+            check(
+                flow.shown.get("step_id") == "ac_test_on"
+                and flow._ac_bin == expect_bin2,
+                f"开机段『自动试下一个』前进到 {expect_bin2} 并重发开机帧",
+            )
+        else:
+            check(flow.aborted == "test_exhausted", "无更多候选 -> abort(test_exhausted)")
+        # 回到 11272 再走一遍两段 ok
+        await flow.async_step_ac_test_on({"test_result": "retry"})
         await flow.async_step_ac_device({"device": "irda_new_ac_11272.bin"})
         infrared.STUB_SENT.clear()
+        await flow.async_step_ac_test_on({"test_result": "ok"})
         await flow.async_step_ac_test({"test_result": "ok"})
         created = flow.created
         data = created["data"]
@@ -2045,7 +2086,7 @@ def main() -> int:
     #      + [10] button 平台 21 项        = 105
     #      + [11] services.yaml 4 项       = 109
     #      + [12] AC 码库 + climate 40 项  = 149  （ac_test 实测步 +4）
-    expected_total = 184
+    expected_total = 189
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(
