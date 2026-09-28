@@ -1,9 +1,9 @@
 {
   "domain": "ir_hub",
   "name": "IR Hub",
-  "version": "0.2.0",
-  "documentation": "https://github.com/ye-cao/ha-ir-hub",
-  "issue_tracker": "https://github.com/ye-cao/ha-ir-hub/issues",
+  "version": "0.2.1",
+  "documentation": "https://github.com/ye-cao/ir_hub",
+  "issue_tracker": "https://github.com/ye-cao/ir_hub/issues",
   "codeowners": ["@ye-cao"],
   "config_flow": true,
   "dependencies": ["infrared"],
