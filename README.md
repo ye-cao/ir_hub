@@ -138,8 +138,13 @@ data:
 
 ## 码库说明
 
-- 按键库已清理：剔除占位键 29,028 / 重复键 1,073（判据由 `tools/selfcheck.py` 守着）。
-  存储 3.66 MB 按类别分块，运行时只解压用到的一块。
+- 双数据源（0.3.4 起）：**collect 路径**（collect_remote × collect_key，用户上传采集码，中文名）
+  + **decode 路径**（remote_index × decode_remote，官方解码库 = 官网 code 页的"控制码"，
+  英文名如 `remote_iptv_dxmh`，设备 id = 索引 id + 100000）。同 (大类， 品牌) 下
+  「键名集合 + 全键值 md5」签名一致视为同一遥控，decode 与 collect 重复的 1,848 个不入库。
+- 按键库已清理：剔除占位键 30,065 / 重复键 2,998（判据由 `tools/selfcheck.py` 守着）。
+  存储 4.21 MB gzip 按类别分块（16 类），运行时只解压用到的一块。**IPTV（电信魔盒等
+  运营商盒子）在「IPTV」大类**，此前整类缺失 0.3.4 已补全。
 - 空调状态码库 399 bin 在 `ac_library/`，解码器移植自
   [SmartAC](https://github.com/ryanh7/SmartAC)（irext 官方 `ir_decode.c` 的 Python 移植，MIT）。
 - irext 按键码存的是无符号长度，符号在读取时补——漏了这步会被
