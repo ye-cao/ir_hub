@@ -74,7 +74,7 @@ TX_TYPE_OPTIONS = {
     TX_INFRARED: "infrared 发射器（ESPHome ir_rf_proxy 等，推荐）",
     TX_BROADLINK: "Broadlink（现成遥控宝，走 remote.send_command）",
     TX_ESPHOME: "ESPHome 动作（SmartAC 兼容，如 esphome.xxx_send_raw_command）",
-    TX_MQTT: "MQTT（Tasmota IRMQTTServer，填 topic）",
+    TX_MQTT: "MQTT（默认发 SmartAC 裸时序数组，填 topic）",
 }
 
 # 各通道目标字段的表单提示（description_placeholders 用）
@@ -82,7 +82,7 @@ _TX_TARGET_LABELS = {
     TX_INFRARED: "下拉选择 infrared 发射器实体",
     TX_ESPHOME: "如 esphome.ir_control_send_raw_command（或只写动作名）",
     TX_BROADLINK: "下拉选择 Broadlink 的 remote 实体",
-    TX_MQTT: "如 tasmota_ir/cmnd/ir（Tasmota IRMQTTServer）",
+    TX_MQTT: "如 tcl_ir/ir_send（SmartAC/tcl-ir 桥，裸数组）；Tasmota 固件也可",
 }
 
 
