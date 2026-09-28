@@ -79,11 +79,12 @@
     "step": {
       "init": {
         "title": "IR Hub settings",
-        "description": "Settings for {title}.\n\nCarrier: most devices use 38000 Hz. Do NOT trust the protocol name in the library — if the device ignores the codes, try 56000 (or 40000) here.\nTransmit count: how many times the frame is sent per press (1 = once). RAISE this if the device only responds every other press.\nBroadlink delay: only used by the Broadlink channel (seconds between sends).",
+        "description": "Settings for {title}.\n\nCarrier: most devices use 38000 Hz. Do NOT trust the protocol name in the library — if the device ignores the codes, try 56000 (or 40000) here.\nTransmit count: how many times the frame is sent per press (1 = once). RAISE this if the device only responds every other press.\nBroadlink delay: only used by the Broadlink channel (seconds between sends).\nMQTT payload format: MQTT channel only. smartac = bare timing array (tcl-ir style bridges, default); tasmota = Tasmota IRMQTTServer RAW JSON.",
         "data": {
           "carrier": "Carrier frequency (Hz)",
           "repeats": "Transmit count",
-          "tx_delay": "Broadlink delay (seconds)"
+          "tx_delay": "Broadlink delay (seconds)",
+          "mqtt_format": "MQTT payload format"
         }
       }
     }

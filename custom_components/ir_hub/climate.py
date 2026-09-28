@@ -39,12 +39,14 @@ from .const import (
     CONF_CATEGORY,
     CONF_DEVICE,
     CONF_EMITTER,
+    CONF_MQTT_FORMAT,
     CONF_REPEATS,
     CONF_TX_DELAY,
     CONF_TX_TARGET,
     CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
+    DEFAULT_MQTT_FORMAT,
     DEFAULT_REPEATS,
     DEFAULT_TX_DELAY,
     DOMAIN,
@@ -115,6 +117,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
             data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
         )
         self._tx_delay: float = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
+        self._mqtt_format: str = data.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT
         # infrared 通道下基类靠它跟踪 emitter 可用性；其它通道不用
         self._infrared_emitter_entity_id: str = self._tx_target
         self._carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
@@ -229,6 +232,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
             command.get_raw_timings(),
             carrier=command.modulation,
             delay=self._tx_delay,
+            mqtt_format=self._mqtt_format,
         )
 
     # ------------------------------------------------------------------ 设置

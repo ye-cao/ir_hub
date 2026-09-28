@@ -79,11 +79,12 @@
     "step": {
       "init": {
         "title": "IR Hub 设置",
-        "description": "「{title}」的设置。\n\n载波频率：绝大多数设备是 38000 Hz。**别相信码库里的协议名** —— 若设备没反应，在这里换 56000（或 40000）试试。\n发送次数：每按一次实际发几遍（1 = 只发一遍）。若设备「隔一次才响应」就把这个调大。\nBroadlink 延迟：仅 Broadlink 通道有效（两次发送之间的间隔秒数）。",
+        "description": "「{title}」的设置。\n\n载波频率：绝大多数设备是 38000 Hz。**别相信码库里的协议名** —— 若设备没反应，在这里换 56000（或 40000）试试。\n发送次数：每按一次实际发几遍（1 = 只发一遍）。若设备「隔一次才响应」就把这个调大。\nBroadlink 延迟：仅 Broadlink 通道有效（两次发送之间的间隔秒数）。\nMQTT 载荷格式：仅 MQTT 通道有效。smartac = 裸时序数组（tcl-ir 等桥接固件，默认）；tasmota = Tasmota IRMQTTServer RAW JSON。",
         "data": {
           "carrier": "载波频率 (Hz)",
           "repeats": "发送次数",
-          "tx_delay": "Broadlink 延迟 (秒)"
+          "tx_delay": "Broadlink 延迟 (秒)",
+          "mqtt_format": "MQTT 载荷格式"
         }
       }
     }

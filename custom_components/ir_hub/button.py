@@ -47,12 +47,14 @@ from .const import (
     CONF_CATEGORY,
     CONF_DEVICE,
     CONF_EMITTER,
+    CONF_MQTT_FORMAT,
     CONF_REPEATS,
     CONF_TX_DELAY,
     CONF_TX_TARGET,
     CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
+    DEFAULT_MQTT_FORMAT,
     DEFAULT_REPEATS,
     DEFAULT_TX_DELAY,
     DOMAIN,
@@ -149,6 +151,7 @@ async def async_setup_entry(
     tx_type = data.get(CONF_TX_TYPE) or TX_INFRARED
     tx_target = data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
     tx_delay = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
+    mqtt_format = data.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT
 
     entities = [
         IrHubButton(
@@ -161,6 +164,7 @@ async def async_setup_entry(
             tx_type=tx_type,
             tx_target=tx_target,
             tx_delay=tx_delay,
+            mqtt_format=mqtt_format,
             device_info=device_info,
             entity_id=f"button.{device_domain_slug}_{key_object_id(key)}",
         )
@@ -197,6 +201,7 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         tx_type: str,
         tx_target: str,
         tx_delay: float,
+        mqtt_format: str,
         device_info: DeviceInfo,
         entity_id: str,
     ) -> None:
@@ -214,6 +219,7 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         self._tx_type = tx_type
         self._tx_target = tx_target
         self._tx_delay = tx_delay
+        self._mqtt_format = mqtt_format
         self._infrared_emitter_entity_id = tx_target
 
         self._carrier = carrier
@@ -246,6 +252,7 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
             command.get_raw_timings(),
             carrier=command.modulation,
             delay=self._tx_delay,
+            mqtt_format=self._mqtt_format,
         )
 
     async def async_press(self) -> None:

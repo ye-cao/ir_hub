@@ -203,8 +203,8 @@ def check_manifests() -> None:
             set(
                 blob.get("options", {}).get("step", {}).get("init", {}).get("data", {})
             )
-            == {"carrier", "repeats", "tx_delay"},
-            f"{lang}: options 步 data 键 = carrier/repeats/tx_delay",
+            == {"carrier", "repeats", "tx_delay", "mqtt_format"},
+            f"{lang}: options 步 data 键 = carrier/repeats/tx_delay/mqtt_format",
         )
 
 
@@ -1026,10 +1026,24 @@ def check_tx() -> None:
             "broadlink 通道 -> remote.send_command（b64 包 = 全正脉冲打包，delay 0.5）",
         )
 
-        # --- 5. mqtt 通道：Tasmota IRMQTTServer RAW JSON ---
+        # --- 5. mqtt 通道：默认 SmartAC 裸数组；tasmota 格式可选 ---
         hass = make_hass()
         await tx_mod.async_send_timings(
-            hass, "mqtt", "tasmota_ir/cmnd/ir", [1000, -500, 300, -400], carrier=38000
+            hass, "mqtt", "tcl_ir/ir_send", [1000, -500, 300, -400], carrier=38000
+        )
+        domain, service, data = hass.services.calls[0]
+        check(
+            (domain, service) == ("mqtt", "publish")
+            and data["topic"] == "tcl_ir/ir_send"
+            and jsonmod.loads(data["payload"]) == [1000, 500, 300, 400],
+            "mqtt 通道默认 = SmartAC 裸全正数组（tcl-ir 桥接固件的契约）",
+            f"实际 {data.get('payload')!r}",
+        )
+
+        hass = make_hass()
+        await tx_mod.async_send_timings(
+            hass, "mqtt", "tasmota_ir/cmnd/ir", [1000, -500, 300, -400],
+            carrier=38000, mqtt_format="tasmota",
         )
         domain, service, data = hass.services.calls[0]
         payload = jsonmod.loads(data["payload"])
@@ -1040,7 +1054,7 @@ def check_tx() -> None:
                 "Protocol": "RAW", "Bits": 0,
                 "Raw": "1000,500,300,400", "Frequency": 38000,
             },
-            "mqtt 通道 -> Tasmota IRMQTTServer RAW JSON（正值序列 + 载波）",
+            "mqtt 通道 tasmota 格式 -> IRMQTTServer RAW JSON（正值序列 + 载波）",
             f"实际 {payload!r}",
         )
 
@@ -1410,6 +1424,29 @@ def check_config_flow() -> None:
             "options 保存 carrier/repeats/tx_delay（改完自动 reload）",
         )
 
+        # ⑧ mqtt 通道的 OptionsFlow 才出现 mqtt_format 字段（默认 smartac）
+        class FakeMqttEntry(FakeEntry):
+            data = {**FakeEntry.data, "tx_type": "mqtt"}
+
+        options = flow_mod.IrHubOptionsFlow()
+        options.config_entry = FakeMqttEntry()
+        await options.async_step_init()
+        mdefaults = _schema_defaults(options.shown["data_schema"])
+        check(
+            mdefaults.get("mqtt_format") == "smartac",
+            "mqtt 条目的 options 出现 mqtt_format（默认 smartac）",
+            f"实际 {mdefaults!r}",
+        )
+        options = flow_mod.IrHubOptionsFlow()
+        options.config_entry = FakeMqttEntry()
+        await options.async_step_init(
+            {"carrier": 40000, "repeats": 2, "tx_delay": 1.0, "mqtt_format": "tasmota"}
+        )
+        check(
+            options.created["data"].get("mqtt_format") == "tasmota",
+            "options 保存 mqtt_format=tasmota",
+        )
+
     asyncio.run(run())
 
 
@@ -1505,6 +1542,7 @@ def check_button_platform() -> None:
             tx_type="infrared",
             tx_target=emitter,
             tx_delay=0.5,
+            mqtt_format="smartac",
             device_info={"identifiers": {(DOMAIN, "test-entry")}},
             entity_id=f"button.{ha_slugify(display)}_{koi(key)}",
         )
@@ -2007,7 +2045,7 @@ def main() -> int:
     #      + [10] button 平台 21 项        = 105
     #      + [11] services.yaml 4 项       = 109
     #      + [12] AC 码库 + climate 40 项  = 149  （ac_test 实测步 +4）
-    expected_total = 181
+    expected_total = 184
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(

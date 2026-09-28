@@ -32,12 +32,14 @@ from .const import (
     CONF_CATEGORY,
     CONF_DEVICE,
     CONF_EMITTER,
+    CONF_MQTT_FORMAT,
     CONF_REPEATS,
     CONF_TX_DELAY,
     CONF_TX_TARGET,
     CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
+    DEFAULT_MQTT_FORMAT,
     DEFAULT_REPEATS,
     DEFAULT_TX_DELAY,
     DOMAIN,
@@ -122,6 +124,7 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
             data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
         )
         self._tx_delay: float = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
+        self._mqtt_format: str = data.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT
 
         # 这是给基类用的：infrared 通道下基类靠它跟踪 emitter 可用性 / 发命令；
         # 其它通道基类跟踪被 async_added_to_hass 跳过，发码也走 transmitter。
@@ -194,6 +197,7 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
             command.get_raw_timings(),
             carrier=command.modulation,
             delay=self._tx_delay,
+            mqtt_format=self._mqtt_format,
         )
 
     # ------------------------------------------------------------------ 发送

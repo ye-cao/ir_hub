@@ -33,15 +33,18 @@ from .const import (
     CONF_CATEGORY,
     CONF_DEVICE,
     CONF_EMITTER,
+    CONF_MQTT_FORMAT,
     CONF_REPEATS,
     CONF_TX_DELAY,
     CONF_TX_TARGET,
     CONF_TX_TYPE,
     CATEGORY_AC,
     DEFAULT_CARRIER,
+    DEFAULT_MQTT_FORMAT,
     DEFAULT_REPEATS,
     DEFAULT_TX_DELAY,
     DOMAIN,
+    MQTT_FORMATS,
     TX_BROADLINK,
     TX_ESPHOME,
     TX_INFRARED,
@@ -537,7 +540,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class IrHubOptionsFlow(config_entries.OptionsFlow):
-    """载波频率、发送次数、Broadlink delay —— 真正需要调的三个旋钮。"""
+    """载波频率、发送次数、Broadlink delay —— 真正需要调的旋钮。"""
 
     async def async_step_init(self, user_input: dict | None = None):
         if user_input is not None:
@@ -546,23 +549,29 @@ class IrHubOptionsFlow(config_entries.OptionsFlow):
         entry = self.config_entry
         current = {**entry.data, **entry.options}
 
+        schema = {
+            vol.Required(
+                CONF_CARRIER,
+                default=int(current.get(CONF_CARRIER) or DEFAULT_CARRIER),
+            ): vol.All(vol.Coerce(int), vol.Range(min=20000, max=60000)),
+            vol.Required(
+                CONF_REPEATS,
+                default=int(current.get(CONF_REPEATS) or DEFAULT_REPEATS),
+            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
+            vol.Required(
+                CONF_TX_DELAY,
+                default=float(current.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY),
+            ): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
+        }
+        # MQTT 载荷格式只有 mqtt 通道有意义（smartac 裸数组 / tasmota RAW JSON）
+        if (current.get(CONF_TX_TYPE) or TX_INFRARED) == TX_MQTT:
+            schema[vol.Required(
+                CONF_MQTT_FORMAT,
+                default=current.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT,
+            )] = vol.In(MQTT_FORMATS)
+
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_CARRIER,
-                        default=int(current.get(CONF_CARRIER) or DEFAULT_CARRIER),
-                    ): vol.All(vol.Coerce(int), vol.Range(min=20000, max=60000)),
-                    vol.Required(
-                        CONF_REPEATS,
-                        default=int(current.get(CONF_REPEATS) or DEFAULT_REPEATS),
-                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
-                    vol.Required(
-                        CONF_TX_DELAY,
-                        default=float(current.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY),
-                    ): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
-                }
-            ),
+            data_schema=vol.Schema(schema),
             description_placeholders={"title": entry.title},
         )

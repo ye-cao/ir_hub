@@ -14,8 +14,8 @@ broadlink          remote.<实体>                  µs→tick(÷30.45) → 0x26
                                                   b64 → `remote.send_command`
                                                   （与 SmartAC raw2broadlink
                                                   逐字节一致，selfcheck 有对拍）
-mqtt               topic                          `mqtt.publish`，Tasmota
-                                                  IRMQTTServer RAW JSON
+mqtt               topic                          `mqtt.publish`，载荷 smartac 裸数组
+                                                  （默认）或 Tasmota RAW JSON
 =================  ============================  ==============================
 
 ⚠️ 三个从 SmartAC 源码核实的细节：
@@ -25,9 +25,10 @@ mqtt               topic                          `mqtt.publish`，Tasmota
   2. Broadlink tick = µs × 269 / 8192（≈ 30.45 µs/tick，**不是** 32.84），
      `0x00` 是转义符（后跟 2 字节 big-endian），包尾 `0x0d 0x05`，整包补零到
      16 字节倍数（AES 块）。
-  3. MQTT 用 Tasmota IRMQTTServer 的 RAW 格式（社区事实标准，刷固件即用）；
-     SmartAC 自己的 MQTT payload 是裸数组（需要自写桥接器），不采用。
-     Tasmota 的 Raw 是逗号分隔的**正值** µs 序列，首个值 = mark。
+  3. MQTT 有两种载荷（`mqtt_format`）：**smartac**（默认）= 裸全正 µs 数组
+     `json.dumps([4450,4450,560,...])` —— tcl-ir 等桥接固件解析的就是它（09-28
+     实测：发 Tasmota JSON 设备无反应）；**tasmota** = IRMQTTServer RAW JSON
+     （`Raw` 是逗号分隔的全正 µs 序列，首个值 = mark），刷 Tasmota 固件即用。
 """
 
 from __future__ import annotations
@@ -42,7 +43,10 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .const import (
     CONF_TX_DELAY,
+    DEFAULT_MQTT_FORMAT,
     DEFAULT_TX_DELAY,
+    MQTT_FORMAT_SMARTAC,
+    MQTT_FORMAT_TASMOTA,
     TX_BROADLINK,
     TX_ESPHOME,
     TX_INFRARED,
@@ -92,6 +96,7 @@ async def async_send_timings(
     *,
     carrier: int,
     delay: float = DEFAULT_TX_DELAY,
+    mqtt_format: str = DEFAULT_MQTT_FORMAT,
 ) -> None:
     """把**带符号**时序（正=mark/负=space，µs）经指定通道发出去。
 
@@ -133,10 +138,14 @@ async def async_send_timings(
         return
 
     if tx_type == TX_MQTT:
-        raw = ",".join(str(abs(t)) for t in timings)
-        payload = json.dumps(
-            {"Protocol": "RAW", "Bits": 0, "Raw": raw, "Frequency": int(carrier)}
-        )
+        if mqtt_format == MQTT_FORMAT_TASMOTA:
+            raw = ",".join(str(abs(t)) for t in timings)
+            payload = json.dumps(
+                {"Protocol": "RAW", "Bits": 0, "Raw": raw, "Frequency": int(carrier)}
+            )
+        else:
+            # SmartAC 契约：裸全正 µs 数组（tcl-ir 等桥接固件解析的就是它）
+            payload = json.dumps([abs(t) for t in timings])
         await hass.services.async_call(
             "mqtt", "publish", {"topic": tx_target, "payload": payload}, blocking=True
         )

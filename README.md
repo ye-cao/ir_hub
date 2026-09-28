@@ -36,7 +36,7 @@ IR Hub 实体 ─ infrared.async_send_command ─ infrared.<emitter> 实体
 | `infrared`（推荐） | infrared emitter 实体 | HA 官方红外体系，配 ESPHome `ir_rf_proxy` |
 | `broadlink` | `remote.*` 实体 | 现成遥控宝；µs→b64 包与 SmartAC 逐字节一致 |
 | `esphome` | `esphome.<动作>` | SmartAC 兼容契约（`{"command": [带符号时序]}`） |
-| `mqtt` | topic | Tasmota IRMQTTServer RAW JSON（刷固件即用） |
+| `mqtt` | topic | **默认发 SmartAC 裸时序数组**（tcl-ir 等桥接固件即插即用）；选项里可切 Tasmota IRMQTTServer RAW JSON |
 
 ESPHome 侧最小配置（仅 `infrared` 通道需要）：
 
