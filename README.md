@@ -248,17 +248,24 @@ HA 的 esphome emitter 只把 `timings` 和 `carrier_frequency=command.modulatio
 | 热水器 | 71 | 250 |
 | 空气净化器 | 52 | 175 |
 | 相机 | 18 | 18 |
-| **空调** | **3** | **3** |
+| **空调（按键库）** | **3** | **3** |
 
-> ⚠️ **空调在 irext 索引库里几乎没有码**（3 台设备、3 条按键）。空调遥控是
-> 状态机式的（温度/模式/风速整帧下发），本来就不适合"按键码库"这套模型。
-> 空调请走 **ESPHome 原生 `climate_ir`**：本机 ESPHome 2026.9.0 实测有 **21 个**平台 ——
-> `gree` / `midea_ir` / **`tcl112`** / `daikin`(+`_arc` / `_brc`) / `mitsubishi` /
-> `toshiba` / `hitachi_ac344` / `hitachi_ac424` / `coolix` / `delonghi` / `fujitsu_general` /
+> 上表的"空调 3 台"是**按键式码库**的口径 —— 空调遥控是状态机式的
+> （温度/模式/风速整帧下发），本来就不适合"按键码库"这套模型，irext 索引库里
+> 也几乎没有空调按键码。
+>
+> **空调走本集成的 `climate` 平台**（v2 起内置）：irext **状态码库** —— 399 个
+> 编码 bin（344 KB）覆盖 **233 品牌 / 1053 型号**，添加集成时选「空调 · 温控面板」
+> 即得恒温器实体（模式/温度/风速原生可调，重启恢复状态）。详见本文开头。
+>
+> 备选方案（若某个型号在状态码库里找不到）：**ESPHome 原生 `climate_ir`**，
+> 本机 ESPHome 2026.9.0 实测有 **21 个**平台 —— `gree` / `midea_ir` /
+> **`tcl112`** / `daikin`(+`_arc` / `_brc`) / `mitsubishi` / `toshiba` /
+> `hitachi_ac344` / `hitachi_ac424` / `coolix` / `delonghi` / `fujitsu_general` /
 > `whirlpool` / `whynter` / `noblex` / `ballu` / `emmeti` / `heatpumpir` / `zhlt01` /
 > `climate_ir_lg`。写法 `climate: - platform: tcl112`（**TCL 空调就是 `tcl112`**，
-> 且不用再加硬件 —— 同一个 GPIO4 发射管就能发）。这样会得到一个带
-> 温度 / 模式 / 风速的 `climate` 实体，比按键码库贴合得多。
+> 且不用再加硬件 —— 同一个 GPIO4 发射管就能发）。固件侧直出 `climate` 实体，
+> 不依赖任何码库，但换码要重烧固件。
 
 ### 存储格式
 
