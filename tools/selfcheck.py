@@ -1,27 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""IR Hub 自检（不依赖 Home Assistant，可在开发机直接跑）。
+"""IR Hub 自检：不依赖 Home Assistant，可在开发机直接跑。
 
-    PY="C:/Users/ye_ca/.workbuddy/binaries/python/envs/default/Scripts/python.exe"
-    $PY tools/selfcheck.py
+    C:/Users/ye_ca/.workbuddy/binaries/python/envs/default/Scripts/python.exe tools/selfcheck.py
 
-检查项：
-  [1] 所有 .py 能被 ast 解析（本机没装 HA，做不到完整 import）
-  [2] manifest.json / hacs.json / translations/*.json 合法，且翻译的
-      step / abort / data 键与 config_flow.py 实际用到的**一一对应**
-  [3] 码库可加载：format、chunk 文件齐全、统计
-  [4] 全库不变式 + ⭐ 逐字节往返
-      · 对全库每一个键，用 library.decode_varints() 解出长度值，
-        再用打包器 pack_irext.py **自己的** zigzag()/put_varint() 重编，
-        必须与 data/<cat>.bin.gz 原始字节逐字节相等
-        —— "打包器 ↔ 读取器"编码一致性的硬证据，不是抽样
-      · 存储必须**全无符号**（负值 0 个）
-      · 补符号后每个键必须含 space 且严格 mark/space 交替
-        —— 否则 RawTimingsCommand 会拒收，一次都发不出去
-  [5] 统计（各类别设备/键数）
-  [6] key_names() 排序
-  [7] ir_command 单元测试（用 stub 顶掉 infrared_protocols）
-      parse_timings / build_raw_command / RawTimingsCommand 的拒收分支
+逐段断言码库、翻译、配置流程、匹配引擎、发码路径的行为；正常时末行是「结果：全部 N 项通过」。
 """
 
 from __future__ import annotations
@@ -43,12 +26,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)                     # ir-hub-integration/
 COMPONENT = os.path.join(ROOT, "custom_components", "ir_hub")
 PACKER = os.path.join(os.path.dirname(ROOT), "ir-remote", "tools", "pack_irext.py")
-# **用户已实测能开关电视**的那份码（HA 侧 script）。用它把"本集成会发出什么"
-# 钉死在"已验证可用的数据"上 —— 剩下的差异就只剩传输路径了。
+# 用户实测能开关电视的那份码（HA 侧 script），用来把"本集成的输出"锚在已验证数据上。
 PROVEN_CODE_YAML = os.path.join(os.path.dirname(ROOT), "ir-remote", "ha", "tcl-tv.yaml")
 
-# ESPHome 的 base64url 路径把单段时长上限设在 500 ms；packed 路径虽然没有该校验，
-# 但超出这个量级基本说明数据坏了，值得当红线盯着。
+# 单段时长的合理上限：ESPHome base64url 路径硬性限制 500 ms，超出基本可判定数据坏了。
 MAX_SANE_TIMING_US = 500_000
 
 FAILURES: list[str] = []
@@ -57,7 +38,7 @@ SKIPPED: list[str] = []
 
 
 def _first_int_array(node) -> list[int] | None:
-    """在任意嵌套的 YAML 结构里找出第一个"像时序数组"的整数列表。"""
+    """在任意嵌套的 YAML 里找出第一个整数序列（长度 > 10 即视作时序数组）。"""
     if isinstance(node, list):
         if len(node) > 10 and all(isinstance(x, int) for x in node):
             return node
@@ -99,10 +80,9 @@ def load_module(name: str, path: str):
 
 
 def make_shim_package() -> None:
-    """library.py / ir_command.py 用相对 import，这里造一个包外壳。
+    """给 library.py / ir_command.py 等建一个包外壳，好让它们的相对 import 成立。
 
-    真正的 `custom_components.ir_hub.__init__` 会 import homeassistant，
-    本机没有 HA，所以只把需要的子模块按 shim 包名挂进 sys.modules。
+    __init__ 会 import homeassistant（本机没有），所以只挂需要的子模块、不走真包。
     """
     shim = types.ModuleType("_ir_hub_shim")
     shim.__path__ = [COMPONENT]
@@ -153,9 +133,9 @@ def check_manifests() -> None:
     langs = sorted(f for f in os.listdir(tdir) if f.endswith(".json"))
     check(bool(langs), f"translations/ 下有语言文件: {langs}")
 
-    # 与 config_flow.py 实际用到的 step / abort reason 对齐。
-    # step_id="x" 同时出现在 ConfigFlow 与 OptionsFlow 里，翻译文件里分别落在
-    # config.step / options.step 下，所以按 "class IrHubOptionsFlow" 切分。
+    # 翻译键要和 config_flow.py 实际用到的 step / abort reason 对齐。
+    # 同一个 step_id 会同时出现在两个 flow 里，翻译分别落在 config.step / options.step，
+    # 故按 "class IrHubOptionsFlow" 切成两段统计。
     src = open(os.path.join(COMPONENT, "config_flow.py"), encoding="utf-8").read()
     head, _, tail = src.partition("class IrHubOptionsFlow")
     config_steps = set(_step_ids(head))
@@ -189,15 +169,32 @@ def check_manifests() -> None:
             f"{lang}: 覆盖所有 abort reason {sorted(reasons)}",
             f"缺 {sorted(reasons - have_aborts)}",
         )
-        # data 键必须与 schema 里的 CONF_* 名一致（拼错会让表单显示原始键名）
+        # data 键要和 schema 里的 CONF_* 名一致（拼错表单会显示原始键名）
         check(
-            set(cfg.get("step", {}).get("user", {}).get("data", {})) == {"tx_type"},
-            f"{lang}: user 步 data 键 = tx_type",
+            set(cfg.get("step", {}).get("user", {}).get("data", {}))
+            == {"tx_type", "mode"},
+            f"{lang}: user 步 data 键 = tx_type/mode",
         )
         check(
             set(cfg.get("step", {}).get("tx", {}).get("data", {}))
             == {"tx_target", "category"},
             f"{lang}: tx 步 data 键 = tx_target/category",
+        )
+        check(
+            set(cfg.get("step", {}).get("learn_setup", {}).get("data", {}))
+            == {"tx_target", "receiver", "category"},
+            f"{lang}: learn_setup 步 data 键 = tx_target/receiver/category",
+        )
+        check(
+            cfg.get("step", {}).get("learn_press", {}).get("data", {}) == {}
+            and set(cfg.get("step", {}).get("learn_press2", {}).get("data", {}))
+            == {"learn_action"}
+            and set(cfg.get("step", {}).get("learn_pick", {}).get("data", {}))
+            == {"device"}
+            and set(cfg.get("step", {}).get("learn_test", {}).get("data", {}))
+            == {"test_result"},
+            f"{lang}: 学习步 data 键对齐（press 无 / press2 learn_action / "
+            f"pick device / test test_result）",
         )
         check(
             set(
@@ -208,7 +205,94 @@ def check_manifests() -> None:
         )
 
 
-# ------------------------------------------------------------------ 3./4./5.
+def check_learn_match() -> None:
+    """学习匹配引擎（learn_match.py）的核心不变式。
+
+    每条都对应一个踩过的坑：回退时只表现为指标变差、不易察觉，故用确定性断言钉死。
+    （统计口径的护栏见 tools/verify_learn_match.py。）
+    """
+    print("\n[13] 学习匹配引擎（learn_match.py）不变式")
+    learn = load_module(
+        "_ir_hub_shim.learn_match", os.path.join(COMPONENT, "learn_match.py")
+    )
+    library_mod = load_module(
+        "_ir_hub_shim.library", os.path.join(COMPONENT, "library.py")
+    )
+    library = library_mod.CodeLibrary()
+    normalize = learn.normalize_capture
+    sim = learn._similarity
+
+    # ① 符号规整：HA 的 InfraredReceivedSignal.timings 可能给全正，也可能给交替符号
+    check(
+        normalize([9000, 4500, 560, 1690, 560, 560, 560, 560])
+        == [9000, -4500, 560, -1690, 560, -560, 560, -560],
+        "normalize_capture：全正数组 -> 偶正奇负",
+    )
+    check(
+        normalize([9000, -4500, 560, -1690, 560, -560, 560, -560])
+        == normalize([9000, 4500, 560, 1690, 560, 560, 560, 560]),
+        "normalize_capture：带符号与全正输入结果一致（幂等）",
+    )
+    check(
+        normalize(None) is None
+        and normalize([9000, 4500, 0, 1690]) is None
+        and normalize([9000, 4500, 560, 1690]) is None,
+        "normalize_capture：空 / 太短(<8) / 含 0 -> None（0 会让奇偶错位）",
+    )
+
+    frame = library.get_timings(47, library.key_names(library.get_device(47))[0])
+    check(abs(sim(frame, frame) - 1.0) < 1e-9, "自比 = 1.0")
+
+    # ② 丢前导码后仍须对齐（缺"库去头"方向的匹配，真帧会崩到 ~0.75 而被错帧挤下）
+    dropped = sim(frame[1:], frame)
+    check(
+        dropped >= 0.99,
+        "丢 1 个前导元素仍 ≥0.99（缺『库去头』对齐方向时真帧会崩到 ~0.75）",
+        f"实际 {dropped:.3f}",
+    )
+
+    # ③ 分数不许饱和（否则容差内的帧全给 1.0，top_n 退化为随机截断）
+    near = list(frame)
+    for i, value in enumerate(near):
+        if value < -800:
+            near[i] = int(value * 0.4)
+            break
+    s_near = sim(near, frame)
+    check(
+        s_near < 0.95,
+        "只差 1 个 bit 的帧分数明显低于真帧（避免饱和在 1.0）",
+        f"实际 {s_near:.3f}",
+    )
+
+    # ④ match_timings 端到端：真帧在无抖动输入下必须排第 1
+    category = 2
+    sampled = matched = 0
+    for device in library.devices:
+        if device["category"] != category:
+            continue
+        if sampled >= 8:
+            break
+        keys = library.key_names(device)
+        if not keys:
+            continue
+        timings = library.get_timings(device["id"], keys[0])
+        if not timings or len(timings) < 8:
+            continue
+        # sampled 必须在所有 continue 之后自增：把取不到键/时序不可用的设备
+        # 算进分母会造出假失败。
+        sampled += 1
+        frames = learn.match_timings(library, category, timings, top_n=1)
+        if frames and learn.frame_signature(frames[0]["frame"]) == learn.frame_signature(
+            timings
+        ):
+            matched += 1
+    check(
+        sampled > 3 and matched == sampled,
+        f"match_timings：真帧全部排第 1（{matched}/{sampled}，电视机大类）",
+    )
+
+
+# ------------------------------------------------------ 3./4./5. 码库 / 不变式 / 统计
 def check_library() -> dict:
     print("\n[3] 码库加载")
     library_mod = load_module(
@@ -235,8 +319,8 @@ def check_library() -> dict:
     )
 
     print("\n[4] 全库不变式 + 逐字节往返（每一个键，不抽样）")
-    # 打包器只在开发树里（且依赖 108 MB 的 irext sqlite 源库），本集成独立发布时
-    # 不会带它 ⇒ 找不到就跳过这一项，其余不变量照查（那些只看集成自己的数据）。
+    # 打包器只在开发树里（且依赖 irext sqlite 源库），独立发布的本集成不带它
+    # ⇒ 找不到就跳过逐字节往返，其余不变量照查（它们只看集成自己的数据）。
     packer = None
     if os.path.exists(PACKER):
         packer = load_module("_pack_irext", PACKER)
@@ -322,7 +406,7 @@ def check_library() -> dict:
         f"最大单段时长 {max_timing} µs ≤ {MAX_SANE_TIMING_US} µs",
     )
 
-    # 回归锚点 1：本机 TCL 电视（device 47），先钉住长度与开头
+    # 锚点 1：本机 TCL 电视（device 47），钉住长度与开头两值
     anchor = library.get_timings(47, "power")
     check(
         anchor is not None and len(anchor) == 156 and anchor[0] == 3963 and anchor[1] == -3985,
@@ -330,9 +414,8 @@ def check_library() -> dict:
         f"实际 {len(anchor) if anchor else None} 项，前 2 值 {(anchor[:2] if anchor else None)}",
     )
 
-    # 回归锚点 2（更强）：与**用户已实测能开关电视**的那份码逐项比对。
-    # 这一条把"本集成会发出什么"钉死在"已验证对真机有效的字节"上 ——
-    # 这样部署后若电视不响应，就可以直接排除"码取错了"，只剩传输路径一个变量。
+    # 锚点 2：与"用户实测可开关电视"的那份码逐项比对，把集成输出锚在已验证有效的
+    # 字节上 —— 部署后若电视无响应，即可排除取码问题，只剩传输路径一个变量。
     if not os.path.exists(PROVEN_CODE_YAML):
         skip(
             "与已实测可用的码逐项比对",
@@ -375,10 +458,7 @@ def check_library() -> dict:
 
 # ------------------------------------------------------------------- 7. 单测
 def check_ir_command() -> None:
-    """用 stub 顶掉 infrared_protocols，单测发码路径。
-
-    这条路径正是自检抓出"全正数组会被拒收"的地方，必须留测试。
-    """
+    """用 stub 顶掉 infrared_protocols，单测发码路径（parse / build / 拒收分支）。"""
     print("\n[7] ir_command 单元测试（stub infrared_protocols）")
 
     pkg = types.ModuleType("infrared_protocols")
@@ -423,14 +503,14 @@ def check_ir_command() -> None:
         "build_raw_command repeats=3 复制三帧",
     )
 
-    # 除零/负数防御
+    # 默认值防御：carrier=0 回落 38000，repeats=0 视为 1
     clamped = mod.build_raw_command([100, -200], carrier=0, repeats=0)
     check(
         clamped.get_raw_timings() == [100, -200] and clamped.modulation == 38000,
         "carrier=0 回落默认 38000；repeats=0 视为 1",
     )
 
-    # 拒收分支：全正数组 / 空数组（正是自检发现的坑）
+    # 拒收分支：全正数组 / 空数组
     for bad_input, label in (([100, 200], "全正数组"), ([], "空数组")):
         try:
             mod.RawTimingsCommand(bad_input, modulation=38000)
@@ -461,11 +541,10 @@ def _install_protocols_stub() -> None:
 
 
 def _install_ha_stubs() -> type:
-    """造一整套最小的 `homeassistant.*` 外壳。
+    """造一套最小的 `homeassistant.*` 外壳，让 remote/climate 等能在无 HA 的机器上 import。
 
-    只为让 `remote.py` 能在没装 HA 的机器上 import 并跑起来 —— 顶部有
-    `from __future__ import annotations`，所以类型注解不求值，只需真实存在的
-    类名 / 常量 / 基类。返回 `HomeAssistantError` 供断言用。
+    有 `from __future__ import annotations`，类型注解不求值，只需类名/常量/基类存在。
+    返回 `HomeAssistantError` 供断言用。
     """
 
     def mod(name: str) -> types.ModuleType:
@@ -550,14 +629,14 @@ def _install_ha_stubs() -> type:
 
     button.ButtonEntity = ButtonEntity
 
-    # `homeassistant.util.slugify`：HA 的真身是 python-slugify（+ Unidecode）的薄封装。
+    # `homeassistant.util.slugify` 真身是 python-slugify（+ Unidecode）的薄封装。
     util = mod("homeassistant.util")
 
     def _slugify(value, separator: str = "_") -> str:
-        """优先用真的 python-slugify；没装就退化到等价简化实现。
+        """优先用真 python-slugify；没装则退化为等价简化实现。
 
-        按键名全是 ASCII（power / vol+ / up / …），简化实现对它们与真实现
-        **结果一致** ⇒ 即使发布形态没装 python-slugify，这条测试依然有效。
+        键名都是纯 ASCII（power / vol+ / up …），两套实现对它们结果一致，
+        所以缺依赖时这条测试依然有效。
         """
         try:
             from slugify import slugify as _real
@@ -613,7 +692,7 @@ def _install_ha_stubs() -> type:
 
     restore_state.RestoreEntity = RestoreEntity
 
-    # `homeassistant.const`（`__init__.py` 的 `from homeassistant.const import Platform`）
+    # `homeassistant.const`（`__init__.py` 从这里 import Platform）
     ha_const = mod("homeassistant.const")
 
     class Platform:
@@ -627,8 +706,7 @@ def _install_ha_stubs() -> type:
     # SmartAC 参照实现（re/smartac/controller.py 差分对拍用）
     ha_const.ATTR_ENTITY_ID = "entity_id"
 
-    # `homeassistant.core.ServiceCall` —— `__init__.py` 用它做类型注解，
-    # 配合 `from __future__ import annotations` 只需名字存在（不会求值）。
+    # ServiceCall 只被 `__init__.py` 用作类型注解，名字存在即可（不会求值）。
     class ServiceCall:
         def __init__(self) -> None:
             self.data: dict = {}
@@ -636,8 +714,7 @@ def _install_ha_stubs() -> type:
 
     core.ServiceCall = ServiceCall
 
-    # `homeassistant.helpers.config_validation`（`__init__.py` import 成 cv，
-    # 用了 cv.entity_id / cv.positive_int）
+    # `__init__.py` 把 config_validation import 成 cv，用到 entity_id / positive_int
     config_validation = mod("homeassistant.helpers.config_validation")
     config_validation.entity_id = str
     config_validation.positive_int = int
@@ -662,7 +739,7 @@ def _install_ha_stubs() -> type:
 def check_remote_entity() -> None:
     """用 stub 跑 `remote.py` 的真实逻辑：发码、重复次数、裸时序、错误分支。
 
-    这条路径没有任何硬件也能测 —— 而它正是上线后会跑的那段代码。
+    无硬件也能测，且跑的正是上线后会执行的代码。
     """
     import asyncio
 
@@ -729,7 +806,7 @@ def check_remote_entity() -> None:
         await entity.async_send_command(["vol+", "vol+"])
         check(len(entity.sent) == 2, "两个键 -> 两次发送")
 
-        # --- ⚠️ 裸字符串（本方法被直接调用时服务 schema 不生效）----
+        # --- 裸字符串（直接调本方法时服务 schema 不生效）---
         entity = build()
         try:
             await entity.async_send_command("power")
@@ -772,7 +849,7 @@ def check_remote_entity() -> None:
         await entity.async_turn_off()
         check(len(entity.sent) == 1, "turn_off 默认按 power")
 
-        # --- 未知键：必须抛清晰错误，而不是静默失败 ---
+        # --- 未知键：应抛清晰错误，而非静默失败 ---
         entity = build()
         try:
             await entity.async_send_command(["no_such_key"])
@@ -790,7 +867,7 @@ def check_remote_entity() -> None:
 def _install_config_flow_stubs() -> None:
     """在 `_install_ha_stubs()` 之上补齐 config_flow 需要的东西。
 
-    ⚠️ `ConfigFlow.__init_subclass__` 必须收 `domain=` —— 我们的 flow 写法是
+    `ConfigFlow.__init_subclass__` 必须收 `domain=`，因为 flow 声明是
     `class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN)`。
     """
     config_entries = sys.modules["homeassistant.config_entries"]
@@ -798,8 +875,8 @@ def _install_config_flow_stubs() -> None:
 
     class ConfigFlow:
         VERSION = 1
-        # ⚠️ 必须放在**类属性**上：`IrHubConfigFlow.__init__` 没有调 `super().__init__()`，
-        #    所以实例上不会有这些属性 —— 放类属性能让"未调用过某个 step"时也能安全读取。
+        # 放类属性：IrHubConfigFlow.__init__ 没调 super().__init__()，实例上没有
+        # 这些属性，放类级才能在"某个 step 没被调用过"时安全读取。
         shown = None
         created = None
         aborted = None
@@ -812,11 +889,9 @@ def _install_config_flow_stubs() -> None:
         def __init__(self):
             self.hass = None
 
-        # ⚠️ 这三个在真实 HA 里是**协程**，由 flow manager 消费；但要特别注意，
-        #    `config_flow` 里写的是 `return self.async_show_form(...)` —— **不 await**。
-        #    所以 stub 必须做成**同步**方法，否则返回的协程根本不会被执行，
-        #    断言永远看到 None（本次就踩了这个坑）。被测的是 config_flow 的分支
-        #    逻辑，不是 HA 的协程契约，故这样等价且更直接。
+        # 这三个在真 HA 里是协程，但 config_flow 写的是 `return self.async_show_form(...)`、
+        # 不 await ⇒ stub 必须做成同步方法，否则返回的协程不执行、断言永远看到 None。
+        # 这里测的是 config_flow 的分支逻辑，不是 HA 的协程契约，同步即可。
         def async_show_form(self, **kwargs):
             self.shown = kwargs
             return kwargs
@@ -849,14 +924,45 @@ def _install_config_flow_stubs() -> None:
     infrared.STUB_EMITTERS = []
     infrared.async_get_emitters = lambda hass: list(infrared.STUB_EMITTERS)
 
-    # 实测步会直接调 `infrared.async_send_command(hass, emitter, command)` ——
-    # 记下调用，供 test 步断言"真的发出去了"。
+    # 实测步会直接调 infrared.async_send_command(...)；记下调用供 test 步断言确实发了。
     infrared.STUB_SENT = []
 
     async def _stub_async_send_command(hass, emitter, command, **kwargs):
         infrared.STUB_SENT.append((emitter, command))
 
     infrared.async_send_command = _stub_async_send_command
+
+    # ---- 学习模式（遥控器配对）需要的接收端 stub ----
+    # config_flow 用 hasattr 探测这两个 API（老版本 HA 只有发射端），必须在
+    # load_module(config_flow) 之前挂上，否则学习模式会被判成"HA 不支持"而 abort。
+    infrared.STUB_RECEIVERS = []
+    infrared.async_get_receivers = lambda hass: list(infrared.STUB_RECEIVERS)
+
+    infrared.STUB_SUBSCRIBERS = []      # [(entity_id, callback)]
+    infrared.STUB_EMIT_RECEIVED = None  # 由下面的闭包赋值
+
+    def _stub_subscribe_receiver(hass, entity_id, callback):
+        subscriber = (entity_id, callback)
+        infrared.STUB_SUBSCRIBERS.append(subscriber)
+
+        def _unsubscribe():
+            try:
+                infrared.STUB_SUBSCRIBERS.remove(subscriber)
+            except ValueError:
+                pass
+
+        return _unsubscribe
+
+    infrared.async_subscribe_receiver = _stub_subscribe_receiver
+
+    def _stub_emit_received(entity_id, timings, modulation=None):
+        """模拟接收器收到一帧：把信号喂给所有订阅了该接收器的回调。"""
+        signal = types.SimpleNamespace(timings=timings, modulation=modulation)
+        for subscribed_id, callback in list(infrared.STUB_SUBSCRIBERS):
+            if subscribed_id == entity_id:
+                callback(signal)
+
+    infrared.STUB_EMIT_RECEIVED = _stub_emit_received
 
 
 def _schema_options(schema, key: str) -> dict | None:
@@ -879,8 +985,8 @@ def _schema_options(schema, key: str) -> dict | None:
 def _schema_defaults(schema) -> dict:
     """取出 schema 各字段的 default（OptionsFlow 默认值断言用）。
 
-    ⚠️ voluptuous 把 `default=` 包进 `default_factory`：`Required(k, default=38000)`
-    的 `marker.default` 是 `lambda: 38000` 而**不是** 38000 ⇒ 必须调用一次。
+    voluptuous 把 default= 包进 default_factory：`marker.default` 是
+    `lambda: 38000` 而非 38000 ⇒ 必须调用一次。
     """
     out = {}
     for marker in schema.schema:
@@ -893,11 +999,10 @@ def _schema_defaults(schema) -> dict:
 
 
 def check_tx() -> None:
-    """发射通道抽象：Broadlink 与 SmartAC 参照实现**逐字节对拍** + 各通道路由。
+    """发射通道抽象：Broadlink 打包与 SmartAC 参照实现逐字节对拍 + 各通道路由。
 
-    SmartAC（re/smartac，MIT）是"兼容性"的锚点 —— 我们的 Broadlink 包必须
-    与它的 raw2broadlink 输出完全一致，才能保证现成遥控宝直接可用。
-    re/ 副本缺失时该项自动跳过（其余检查照常）。
+    SmartAC（re/smartac，MIT）是兼容性锚点：Broadlink 包必须与它的 raw2broadlink
+    输出完全一致，现成遥控宝才直接可用。re/ 副本缺失时该项自动跳过。
     """
     import asyncio
     import base64 as b64mod
@@ -1110,11 +1215,10 @@ def check_tx() -> None:
 
 
 def check_config_flow() -> None:
-    """跑 `config_flow.py` 的真实逻辑（**真 voluptuous** + stub homeassistant）。
+    """跑 `config_flow.py` 的真实逻辑（真 voluptuous + stub homeassistant）。
 
-    这是用户**第一步**就会走的路 —— 这里坏掉等于集成根本加不上。
-    用真 voluptuous 是有意的：能顺带验证「`vol.In(字典)` 提交回来的是 key 字符串」
-    这个假设 —— `config_flow` 紧接着 `int(user_input[...])`，假设错了就全盘崩。
+    刻意用真 voluptuous：顺带验证「vol.In(字典) 提交回来的是 key 字符串」这个假设 ——
+    config_flow 紧接着 int(user_input[...])，假设错了就全盘崩。
     """
     import asyncio
 
@@ -1196,7 +1300,7 @@ def check_config_flow() -> None:
     )
 
     async def run():
-        # ① 一个 emitter 都没有 -> infrared 通道在 tx 步 abort（引导用户先去配 ESPHome）
+        # ① 无 emitter -> infrared 通道在 tx 步 abort（提示先去配 ESPHome）
         infrared.STUB_EMITTERS = []
         flow = new_flow()
         await flow.async_step_user()
@@ -1215,7 +1319,7 @@ def check_config_flow() -> None:
             f"user 步给出 4 种发射通道（{list(tx_opts)}）",
         )
 
-        # ③ 真 voluptuous 校验：确认 `vol.In(字典)` 提交回来的是 **key 字符串**
+        # ③ 真 voluptuous 校验：确认 vol.In(字典) 提交回来的是 key 字符串
         validated = flow.shown["data_schema"]({"tx_type": "infrared"})
         check(validated["tx_type"] == "infrared", "vol.In(字典) 返回 key 字符串")
 
@@ -1258,7 +1362,7 @@ def check_config_flow() -> None:
         check("TCL电视-1" in label47, "device 步列出 TCL电视-1", f"实际 {label47!r}")
         check("RCA" in label47, f"型号附 irext 协议提示 -> {label47!r}")
 
-        # ⑥ 选型号 -> 进 test 步（发实测码，**不直接建 entry**）
+        # ⑥ 选型号 -> 进 test 步（发实测码，不直接建 entry）
         flow = new_flow()
         flow._tx_type = "infrared"
         flow._tx_target = EMITTER
@@ -1390,6 +1494,276 @@ def check_config_flow() -> None:
             "esphome 通道 entry 只记 tx 字段（不写 emitter 别名）",
         )
 
+        # ⑩ 学习模式（遥控器配对）：user(mode=learn) → … → 建 entry。
+        #    用真码库 + 真设备 ID（47 = TCL电视-1）跑完整链路，含真实的匹配一遍。
+        RECEIVER = "infrared.hjy_ir_receiver"
+
+        infrared.STUB_RECEIVERS = []
+        fl = new_flow()
+        await fl.async_step_user()
+        mode_opts = _schema_options(fl.shown["data_schema"], "mode") or {}
+        check(
+            list(mode_opts) == ["browse", "learn"],
+            f"第 1 步给出配置方式下拉（{list(mode_opts)}）",
+        )
+        await fl.async_step_user({"tx_type": "infrared", "mode": "learn"})
+        check(fl.aborted == "no_receivers", "learn 模式但无接收器 -> abort(no_receivers)")
+
+        # 老版本 HA 无接收端 API 时须给出明确 abort，而不是 AttributeError
+        fl_no_api = new_flow()
+        saved_flag = flow_mod._HAS_RECEIVER_API
+        flow_mod._HAS_RECEIVER_API = False
+        try:
+            await fl_no_api.async_step_learn_setup()
+            check(
+                fl_no_api.aborted == "receiver_api_missing",
+                "HA 无接收端 API -> abort(receiver_api_missing)（不是崩栈）",
+            )
+        finally:
+            flow_mod._HAS_RECEIVER_API = saved_flag
+
+        infrared.STUB_RECEIVERS = [RECEIVER]
+        fl = new_flow()
+        await fl.async_step_user({"tx_type": "infrared", "mode": "learn"})
+        check(fl.shown.get("step_id") == "learn_setup", "learn 模式 -> 进 learn_setup 步")
+        ls = fl.shown["data_schema"]
+        check(
+            _schema_options(ls, "receiver") == {RECEIVER: RECEIVER},
+            "learn_setup 列出全部接收器实体",
+        )
+        lcats = _schema_options(ls, "category") or {}
+        check(
+            "2" in lcats and "ac" in lcats and "空调" in lcats.get("ac", ""),
+            f"learn 大类下拉含按键类与空调（共 {len(lcats)} 项，ac={lcats.get('ac')!r}）",
+        )
+        await fl.async_step_learn_setup(
+            {"tx_target": EMITTER, "receiver": RECEIVER, "category": "2"}
+        )
+        check(fl.shown.get("step_id") == "learn_press", "选完接收器+大类 -> 进 learn_press 步")
+        check(
+            len(infrared.STUB_SUBSCRIBERS) == 1
+            and infrared.STUB_SUBSCRIBERS[0][0] == RECEIVER,
+            "learn_press 已订阅所选接收器",
+        )
+
+        # 没按遥控器就提交 -> no_signal，且订阅保持（用户可直接再按再提交）
+        await fl.async_step_learn_press({})
+        check(
+            (fl.shown.get("errors") or {}).get("base") == "no_signal"
+            and fl.shown.get("step_id") == "learn_press"
+            and len(infrared.STUB_SUBSCRIBERS) == 1,
+            "learn_press 无信号 -> errors.no_signal（订阅保持，不用重进这一步）",
+        )
+
+        lib = fl._library
+        key1 = lib.key_names(lib.get_device(47))[0]
+        t1 = lib.get_timings(47, key1)
+        infrared.STUB_EMIT_RECEIVED(RECEIVER, t1)      # 模拟按下电源键
+        await fl.async_step_learn_press({})
+        check(fl.shown.get("step_id") == "learn_press2", "收到电源键 -> 进 learn_press2 步")
+        # 订阅数恰为 1 ⇒ 电源键那次订阅已退掉、只剩 press2 新订的这一个；
+        # 若 learn_press 退订泄漏，这里会是 2 —— 泄漏就靠这个数字抓出来。
+        check(
+            fl._learn_capture1 == t1 and len(infrared.STUB_SUBSCRIBERS) == 1,
+            "捕获到完整电源键时序，且旧订阅已退（旧泄漏则订阅数=2）、press2 重新订阅",
+            f"capture1 len={len(fl._learn_capture1 or [])} / subs={len(infrared.STUB_SUBSCRIBERS)}",
+        )
+
+        # 跳过第二键 -> 单键候选
+        await fl.async_step_learn_press2({"learn_action": "skip"})
+        check(fl.shown.get("step_id") == "learn_pick", "跳过第二键 -> 进 learn_pick 步")
+        cands1 = _schema_options(fl.shown["data_schema"], "device") or {}
+        check("47" in cands1, f"单键匹配候选含真值 TCL电视-1（{len(cands1)} 个候选）")
+        check(fl._learn_used_two_keys is False, "跳过后标记为『仅电源键』")
+
+        # 两键路径（真值必须在交集里）
+        fl2 = new_flow()
+        await fl2.async_step_user({"tx_type": "infrared", "mode": "learn"})
+        await fl2.async_step_learn_setup(
+            {"tx_target": EMITTER, "receiver": RECEIVER, "category": "2"}
+        )
+        infrared.STUB_EMIT_RECEIVED(RECEIVER, t1)
+        await fl2.async_step_learn_press({})
+        key2 = lib.key_names(lib.get_device(47))[1]
+        t2 = lib.get_timings(47, key2)
+        infrared.STUB_EMIT_RECEIVED(RECEIVER, t2)
+        await fl2.async_step_learn_press2({"learn_action": "next"})
+        check(fl2.shown.get("step_id") == "learn_pick", "两键都收到 -> 进 learn_pick 步")
+        cands2 = _schema_options(fl2.shown["data_schema"], "device") or {}
+        check(
+            "47" in cands2,
+            f"两键交集候选含真值（交集 {len(cands2)} 个 / 单键 {len(cands1)} 个）",
+        )
+        check(fl2._learn_used_two_keys is True, "两键路径标记为『两键交集』")
+        ph2 = fl2.shown["description_placeholders"]
+        check(
+            ph2.get("keys") == "两键交集" and "score" in ph2 and "count" in ph2
+            and ph2.get("category") == "电视机",
+            "learn_pick 占位符带 category/keys/score/count",
+            f"实际 {ph2!r}",
+        )
+
+        # 选候选 -> learn_test（真的发出一帧）-> ok 建 entry
+        infrared.STUB_SENT.clear()
+        await fl2.async_step_learn_pick({"device": "47"})
+        check(fl2.shown.get("step_id") == "learn_test", "选完候选 -> 进 learn_test 步")
+        check(
+            len(infrared.STUB_SENT) == 1 and infrared.STUB_SENT[0][0] == EMITTER,
+            "learn_test 立即经所选 emitter 发出测试码",
+            f"实际 {infrared.STUB_SENT!r}",
+        )
+        ltest = _schema_options(fl2.shown["data_schema"], "test_result") or {}
+        check(
+            list(ltest) == ["ok", "retry", "skip"],
+            f"learn_test 下拉 = ok/retry/skip（学习模式没有『下一个型号』，{list(ltest)}）",
+        )
+        await fl2.async_step_learn_test({"test_result": "retry"})
+        check(fl2.shown.get("step_id") == "learn_pick", "learn_test 选『没反应』-> 退回 learn_pick")
+        await fl2.async_step_learn_pick({"device": "47"})
+        await fl2.async_step_learn_test({"test_result": "ok"})
+        d_learn = fl2.created["data"]
+        check(
+            fl2.created["title"] == "TCL电视-1"
+            and d_learn["category"] == 2
+            and d_learn["brand"] == 14
+            and d_learn["device"] == 47
+            and d_learn["tx_target"] == EMITTER,
+            f"learn 建的 entry 与真值一致（{fl2.created['title']!r} "
+            f"{d_learn.get('category')}/{d_learn.get('brand')}/{d_learn.get('device')}）",
+        )
+
+        # ⑪ 空调也能配对：走状态码库（learn_match_ac），实测复用「开机 → 关机」两段式
+        ac_mod = sys.modules["_ir_hub_shim.ac_library"]
+        ac_lib = ac_mod.AcLibrary()
+        AC_BIN = "irda_new_ac_11272.bin"          # 美的，索引里真实存在
+        ac_frames = list(ac_mod.iter_frames(ac_lib.read_raw(AC_BIN)))
+        ac_on1 = ac_frames[0][1]
+        ac_on2 = next(f for _s, f in ac_frames if f != ac_on1)   # 同型号的另一个状态帧
+
+        fl_ac = new_flow()
+        await fl_ac.async_step_user({"tx_type": "infrared", "mode": "learn"})
+        await fl_ac.async_step_learn_setup(
+            {"tx_target": EMITTER, "receiver": RECEIVER, "category": "ac"}
+        )
+        check(
+            fl_ac.shown.get("step_id") == "learn_press" and fl_ac._category == "ac",
+            "配对流程可选大类「空调」（category 存 'ac'，不是数字 id）",
+        )
+        infrared.STUB_EMIT_RECEIVED(RECEIVER, ac_on1)
+        await fl_ac.async_step_learn_press({})
+        check(
+            fl_ac.shown.get("step_id") == "learn_press2"
+            and fl_ac._learn_capture1 == ac_on1,
+            "空调电源键捕获成功（整帧入 capture1）",
+        )
+        ph_ac = fl_ac.shown["description_placeholders"]
+        check(
+            ph_ac.get("key_hint") == "温度+（或风速键）" and ph_ac.get("category") == "空调",
+            "空调的按键提示与 category 占位符按空调改写（不是音量+/电视机）",
+            f"实际 {ph_ac!r}",
+        )
+        await fl_ac.async_step_learn_press2({"learn_action": "skip"})
+        ac_opts = _schema_options(fl_ac.shown["data_schema"], "device") or {}
+        check(
+            AC_BIN in ac_opts and len(ac_opts) > 1,
+            f"空调单键匹配候选含真值（{AC_BIN} 命中，共 {len(ac_opts)} 个候选）",
+        )
+        AC_BRANDS = ac_lib.brands_of(AC_BIN)
+        check(
+            fl_ac.shown["description_placeholders"].get("category") == "空调"
+            and ac_opts.get(AC_BIN) == f"空调 11272（{len(AC_BRANDS)} 个品牌共用）",
+            f"多品牌共用码的候选名标出共用数、不冒认单一品牌（{ac_opts.get(AC_BIN)!r}）",
+            f"实际 {ac_opts.get(AC_BIN)!r}，该 bin 共有 {len(AC_BRANDS)} 个品牌",
+        )
+        infrared.STUB_SENT.clear()
+        await fl_ac.async_step_learn_pick({"device": AC_BIN})
+        check(
+            fl_ac.shown.get("step_id") == "ac_test_on" and fl_ac._from_learn is True,
+            "选中空调候选 -> 进第一段实测（开机帧）",
+        )
+        check(
+            len(infrared.STUB_SENT) == 1 and infrared.STUB_SENT[0][0] == EMITTER,
+            "空调配对同样真的发出开机帧（经所选 emitter）",
+            f"实际 {infrared.STUB_SENT!r}",
+        )
+        check(
+            fl_ac.shown["description_placeholders"].get("brand")
+            == f"{len(AC_BRANDS)} 个品牌共用",
+            "多品牌共用码的实测文案说成『N 个品牌共用』（不写成某个牌子）",
+            f"实际 {fl_ac.shown['description_placeholders'].get('brand')!r}",
+        )
+        await fl_ac.async_step_ac_test_on({"test_result": "retry"})
+        check(
+            fl_ac.shown.get("step_id") == "learn_pick",
+            "空调实测『没反应』-> 退回候选列表（而不是手动选型号步）",
+        )
+        await fl_ac.async_step_learn_pick({"device": AC_BIN})
+        await fl_ac.async_step_ac_test_on({"test_result": "ok"})
+        check(
+            fl_ac.shown.get("step_id") == "ac_test",
+            "开机有反应 -> 进第二段（关机帧）实测",
+        )
+        await fl_ac.async_step_ac_test({"test_result": "ok"})
+        d_ac_learn = fl_ac.created["data"]
+        check(
+            d_ac_learn["category"] == "ac"
+            and d_ac_learn["device"] == AC_BIN
+            and d_ac_learn["brand"] == ""
+            and fl_ac.created["title"] == "空调 11272",
+            f"空调配对建的 entry 与真值一致（{fl_ac.created['title']!r} "
+            f"{d_ac_learn.get('category')}/{d_ac_learn.get('brand')!r}/{d_ac_learn.get('device')}）"
+            " —— 共用码不写品牌名",
+        )
+
+        # 配对路径的「自动试下一个」= 下一个**匹配候选**（跨品牌），品牌标签要跟着换
+        fl_ac3 = new_flow()
+        await fl_ac3.async_step_user({"tx_type": "infrared", "mode": "learn"})
+        await fl_ac3.async_step_learn_setup(
+            {"tx_target": EMITTER, "receiver": RECEIVER, "category": "ac"}
+        )
+        infrared.STUB_EMIT_RECEIVED(RECEIVER, ac_on1)
+        await fl_ac3.async_step_learn_press({})
+        await fl_ac3.async_step_learn_press2({"learn_action": "skip"})
+        cands3 = fl_ac3._learn_candidates or []
+        await fl_ac3.async_step_learn_pick({"device": cands3[0]})
+        if len(cands3) > 1:
+            await fl_ac3.async_step_ac_test_on({"test_result": "next"})
+            next_bin = fl_ac3._ac_bin
+            want_label = (
+                f"{fl_ac3._ac_brand_count} 个品牌共用"
+                if fl_ac3._ac_brand_count > 1
+                else ac_lib.brand_of(next_bin)
+            )
+            check(
+                next_bin == cands3[1]
+                and fl_ac3._ac_index == 1
+                and fl_ac3._ac_brand_count == len(ac_lib.brands_of(next_bin))
+                and fl_ac3.shown["description_placeholders"].get("brand") == want_label,
+                f"配对路径『自动试下一个』切到下一个匹配候选并同步品牌标签"
+                f"（{cands3[0]} -> {next_bin}）",
+                f"实际 index={fl_ac3._ac_index} brand={fl_ac3._ac_brand!r} "
+                f"count={fl_ac3._ac_brand_count}",
+            )
+        else:
+            check(False, "配对路径『自动试下一个』切到下一个匹配候选", "候选只有 1 个")
+
+        fl_ac2 = new_flow()
+        await fl_ac2.async_step_user({"tx_type": "infrared", "mode": "learn"})
+        await fl_ac2.async_step_learn_setup(
+            {"tx_target": EMITTER, "receiver": RECEIVER, "category": "ac"}
+        )
+        infrared.STUB_EMIT_RECEIVED(RECEIVER, ac_on1)
+        await fl_ac2.async_step_learn_press({})
+        infrared.STUB_EMIT_RECEIVED(RECEIVER, ac_on2)
+        await fl_ac2.async_step_learn_press2({"learn_action": "next"})
+        ac2_opts = _schema_options(fl_ac2.shown["data_schema"], "device") or {}
+        check(
+            fl_ac2.shown.get("step_id") == "learn_pick"
+            and AC_BIN in ac2_opts
+            and fl_ac2._learn_used_two_keys is True,
+            f"空调两键取交集仍含真值（交集 {len(ac2_opts)} 个候选）",
+        )
+
         check(
             flow_mod.IrHubConfigFlow.async_get_options_flow(None).__class__.__name__
             == "IrHubOptionsFlow",
@@ -1451,9 +1825,9 @@ def check_config_flow() -> None:
 
 
 def check_button_platform() -> None:
-    """[10] button 平台 —— 每键一个按钮；重点是 entity_id 的撞名防护。
+    """button 平台：每键一个按钮，重点在 entity_id 的撞名防护。
 
-    这条路径没有硬件也能测，且跑的正是上线后会跑的代码。
+    无硬件也能测，且跑的正是上线后会执行的代码。
     """
     import asyncio
 
@@ -1490,13 +1864,11 @@ def check_button_platform() -> None:
         "⭐ 正负号键不再撞名（裸 slugify 会把 vol+/vol- 都压成 vol）",
     )
 
-    # --- 2. ⭐ 不变量：**同一台设备内**按键 object_id 不能撞名 ---
-    # 先给全库所有键名（实测只有 61 种）建一张 object_id 映射表 —— 只做 61 次
-    # slugify；再逐设备查表（15 万次字典查找，很快）。
-    # ⚠️ 别改成"逐设备逐键调 slugify"：实测直接卡死（Unidecode 开销）。
-    # ⚠️ 也别把判据写成"全局键名集合无撞名" —— 那个条件**过严**：实测全库同时存在
-    #    'Shake' 与 'shake'（slugify 后同为 'shake'），但**没有任何设备同时含这两键**
-    #    （含 Shake 的 20 台 / 含 shake 的 364 台，交集 0）⇒ 实际不撞。
+    # --- 2. 不变量：同一台设备内按键 object_id 不能撞名 ---
+    # 先给全库键名（仅 61 种）建 object_id 映射表，再逐设备查表；不要逐键调 slugify
+    # （Unidecode 开销大，会卡死）。
+    # 判据是"同一设备内不撞名"而非"全局键名不撞名"：全库同时有 'Shake' 与 'shake'
+    # （slugify 后同为 'shake'），却没有任何设备同时含这两键，故实际不撞。
     all_key_names = sorted({k for dev in library.devices for k in dev["keys"]})
     oid_of = {k: koi(k) for k in all_key_names}
     dup_devs = []
@@ -1566,8 +1938,8 @@ def check_button_platform() -> None:
     check(button_mod.PARALLEL_UPDATES == 0, "PARALLEL_UPDATES = 0（红外无状态，不轮询）")
 
     # --- 4. async_press 真的把码交给 emitter ---
-    # ⚠️ 下面三条**必须无条件执行**（不能用 `if btn.sent:` 包起来）：否则一旦发送
-    #    失败，就会静默少跑两项 —— 那正是"项数护栏"要防的假通过。
+    # 下面三条必须无条件执行（不能包进 `if btn.sent:`）：发送失败时会静默少跑两项，
+    # 那正是项数护栏要防的假通过。
     asyncio.run(btn.async_press())
     check(len(btn.sent) == 1, "async_press 发出 1 次")
     cmd = btn.sent[0] if btn.sent else None
@@ -1619,12 +1991,10 @@ def check_button_platform() -> None:
 
 
 def check_services_yaml() -> None:
-    """[11] services.yaml 与 SEND_RAW_SCHEMA 的字段一致性。
+    """services.yaml 与 SEND_RAW_SCHEMA 的字段一致性。
 
-    services.yaml 只影响 UI 展示（HA「开发者工具 → 操作」里的中文标签与选择器），
-    但**格式错会被 HA 拒绝加载，而且是静默的** —— 所以值得一条断言。
-    还要防"UI 里写的字段"与"真正校验的 schema"不一致（多写一个用户会填了没用、
-    少写一个用户在 UI 里看不到）。
+    services.yaml 只影响 UI 展示，但格式错会被 HA 静默拒绝加载，故值得一条断言；
+    字段还要和真正校验的 schema 一致（多写用户填了没用，少写 UI 里看不到）。
     """
     print("\n[11] services.yaml（服务元数据 / UI 展示）")
     path = os.path.join(COMPONENT, "services.yaml")
@@ -1663,13 +2033,12 @@ def check_services_yaml() -> None:
 
 
 def check_ac() -> None:
-    """[12] AC 状态码库 + climate 平台。
+    """AC 状态码库 + climate 平台。
 
-    三层：
-      A. 码库数据（index 覆盖、bin 齐全、关键品牌在位）
-      B. 解码器（全库 399 bin 解码 + 符号交替不变式 + 与实测日志对齐的锚点）
-      C. climate 实体逻辑（stub homeassistant，跑真实代码路径）
-      D. config flow 的 AC 分支（真 voluptuous）
+    A. 码库数据（index 引用的 bin 齐全、关键品牌在位）
+    B. 解码器（全库 bin 解码 + 符号交替不变式 + 锚点）
+    C. climate 实体逻辑（stub homeassistant，跑真实代码路径）
+    D. config flow 的 AC 分支（真 voluptuous）
     """
     import asyncio
 
@@ -1739,7 +2108,7 @@ def check_ac() -> None:
         f"AC 最大单段时长 {max_timing} µs ≤ {MAX_SANE_TIMING_US} µs",
     )
 
-    # 锚点：美的 11272（用户 SmartAC 实配的型号）—— 钉住长度与引导码
+    # 锚点：美的 11272（SmartAC 实配过的型号），钉住模式集与引导码
     code = ac_lib.load_device("irda_new_ac_11272.bin")
     frame = code["commands"]["cool"]["auto"]["26"]
     check(
@@ -1863,7 +2232,7 @@ def check_ac() -> None:
             )
         else:
             check(False, "不存在的模式×风速组合 -> HomeAssistantError", "竟然没抛")
-        # 恢复：历史状态 off/heat/25
+        # RestoreEntity：历史状态 heat / medium / 25
         entity = build()
 
         class FakeState:
@@ -1982,8 +2351,8 @@ def check_ac() -> None:
             len(on_timings) >= 2 and any(t < 0 for t in on_timings),
             f"开机帧非空且带符号（{len(on_timings)} 个时序值）",
         )
-        # 开机帧选帧逻辑 = SmartAC async_test：mode/fan 优先 auto，温度优先 26、
-        # 否则取第一个（11272 的 auto 模式只有 17~24 ⇒ 实发 auto/auto/17）
+        # 选帧对齐 SmartAC async_test：mode/fan 优先 auto，温度优先 26、否则取第一个
+        # （11272 的 auto 模式只有 17~24 ⇒ 实发 auto/auto/17）
         ac_code = flow._ac_code
         _m = "auto" if "auto" in ac_code["commands"] else next(iter(ac_code["commands"]))
         _f = "auto" if "auto" in ac_code["commands"][_m] else next(iter(ac_code["commands"][_m]))
@@ -2074,19 +2443,26 @@ def main() -> int:
     check_button_platform()
     check_services_yaml()
     check_ac()
+    check_learn_match()
 
-    # ⚠️ 自检自身的护栏（务必保留）：若某一段 check 因为异常、条件分支或脚本被
-    #    换回旧版本而**整段没执行**，CHECKS 会变小，但脚本照旧打印"全部通过"，
-    #    只是数字变小 —— 不看数字就发现不了。本项目真发生过一次：一段整段未
-    #    执行，报告"全部 46 项通过"，而当时基准是 61 项。
-    #    `CHECKS + len(SKIPPED)` 恒定等于下面的常数，且**与形态无关**：发布形态下
-    #    被外部依赖挡掉的那两项会计入 SKIPPED，所以两者相加仍然相等。
-    #    新增/删除 check 时必须同步这个数字。
+    # 自检自身的护栏（务必保留）：某段 check 若因异常/条件分支/回退旧版本而整段
+    # 没执行，CHECKS 会变小，但脚本照旧打印"全部通过"，不看数字发现不了 —— 本项目
+    # 真发生过一次。`CHECKS + len(SKIPPED)` 恒定等于下面的常数，与发布形态无关
+    # （被外部依赖挡掉的项计入 SKIPPED，两者相加仍相等）。新增/删除 check 时须同步。
     #      [1]~[8] + [9] config_flow 23 项 = 84   （⑥ 实测步 test +5）
     #      + [10] button 平台 21 项        = 105
     #      + [11] services.yaml 4 项       = 109
     #      + [12] AC 码库 + climate 40 项  = 149  （ac_test 实测步 +4）
-    expected_total = 189
+    #      + 学习模式 [9] 内 23 项 + 翻译 data 键 4 项 = 189 → 216
+    #        详见「⑩ 学习模式」段：mode/abort/订阅/no_signal/单键/双键/pick/test/entry
+    #      + [13] learn_match 不变式 7 项  = 223
+    #      + ⑪ 空调也能配对 13 项          = 236
+    #        （选空调大类 / 捕获电源键 / 占位符改写 / 单键候选含真值 /
+    #          共用码候选名不冒认品牌 / 进 ac_test_on + 真发帧 /
+    #          共用码实测文案 / retry 退回候选 / ok 进 ac_test /
+    #          entry 校验（共用码品牌留空）/ 跨品牌『自动试下一个』 /
+    #          两键交集仍含真值）
+    expected_total = 236
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(

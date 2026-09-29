@@ -1,11 +1,11 @@
 """remote 平台 —— 每个 config entry = 一个 remote 实体（对应一台家电）。
 
-一个 remote 实体代表"码库里的某台设备 + 一个 infrared emitter"：
-  · 它的 activity_list 就是这台设备的全部可用按键
-  · 调 `remote.send_command` 时，把按键名映射成码库里的时序发出去
+一个 remote 实体代表"码库里的某台设备 + 一个发射器"：
+  · activity_list 就是这台设备的全部可用按键；
+  · 调 `remote.send_command` 时把按键名映射成码库里的时序发出去。
 
-为什么用 remote 实体：HA 的 `remote` 域本身就是"通用遥控器"的表达，
-自带 send_command / turn_on / turn_off 服务，dashboard 侧做按钮面板最省事。
+用 remote 实体的理由：`remote` 域本身就是"通用遥控器"的表达，自带
+send_command / turn_on / turn_off，做面板最省事。
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from .transmitter import async_send_timings
 
 _LOGGER = logging.getLogger(__name__)
 
-# 本平台不轮询设备（红外是单向的，也没有可读状态）
+# 红外单向、无可读状态 —— 不轮询
 PARALLEL_UPDATES = 0
 
 # 逃生口前缀：command: ["raw:1000 -500 1000"] 可直接指定裸时序
@@ -63,10 +63,9 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the remote platform."""
+    """建立该条目的 remote 实体（空调条目由 climate 平台接管）。"""
     data = {**entry.data, **entry.options}
     if data.get(CONF_CATEGORY) == CATEGORY_AC:
-        # 空调条目走 climate 平台（状态机码库没有"按键"可言）
         _LOGGER.debug("IR Hub: AC entry %s -> climate platform, remote skipped", entry.entry_id)
         return
 
@@ -75,17 +74,13 @@ async def async_setup_entry(
 
 
 class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
-    """A remote entity backed by an irext device from the bundled code library.
+    """码库里的某台 irext 设备，映射成 remote 实体。
 
     多重继承说明：
-      · `InfraredEmitterConsumerEntity` 提供 `_send_command()` 与
-        **自动跟随 emitter 可用性**（emitter 掉线 → 本实体 unavailable，
-        emitter 上线 → 自动恢复），符合官方对 consumer 的要求
-        （consumer 不得直接调 `InfraredEmitterEntity.async_send_command`）。
-      · `RemoteEntity` 提供 remote 域的服务契约（send_command / turn_on / turn_off）
-        与 activity_list 状态属性。
-      MRO：IrHubRemote → InfraredEmitterConsumerEntity → InfraredConsumerEntity
-           → RemoteEntity → ToggleEntity → Entity
+      · `InfraredEmitterConsumerEntity` 提供 `_send_command()` 与**自动跟随
+        emitter 可用性**（掉线 → 实体 unavailable，上线自动恢复），符合官方对
+        consumer 的要求（不得直接调 `InfraredEmitterEntity.async_send_command`）。
+      · `RemoteEntity` 提供 remote 域的服务契约与 activity_list 状态属性。
     """
 
     _attr_has_entity_name = True
@@ -98,10 +93,9 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
         entry: ConfigEntry,
         library: CodeLibrary,
     ) -> None:
-        # 惯例上必须调（已核实：HA 当前的 `Entity` **没有** `__init__`，初始化职责在
-        # `add_to_platform_start`，而 `_context` / `_attr_available` /
-        # `_attr_should_poll` 都是带默认值的**类属性** ⇒ 不调也能跑）。
-        # 仍然调，是为了将来 HA 真给 `Entity.__init__` 加东西时不会静默跳过。
+        # 惯例上要调。已核实 HA 当前的 `Entity` 没有 `__init__`（初始化在
+        # `add_to_platform_start`，各 _attr_* 是带默认值的类属性）⇒ 不调也能跑；
+        # 调它是为了将来 HA 真加了 `Entity.__init__` 时不会静默跳过。
         super().__init__()
 
         data = {**entry.data, **entry.options}
@@ -118,7 +112,7 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
         self._keys = library.key_names(device)
 
         # ---- 发射通道（infrared / esphome / broadlink / mqtt）----
-        # 旧条目只有 CONF_EMITTER ⇒ 兼容回退为 infrared + emitter 实体
+        # 旧条目只有 CONF_EMITTER ⇒ 回退为 infrared + emitter 实体
         self._tx_type: str = data.get(CONF_TX_TYPE) or TX_INFRARED
         self._tx_target: str = (
             data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
@@ -126,8 +120,8 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
         self._tx_delay: float = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
         self._mqtt_format: str = data.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT
 
-        # 这是给基类用的：infrared 通道下基类靠它跟踪 emitter 可用性 / 发命令；
-        # 其它通道基类跟踪被 async_added_to_hass 跳过，发码也走 transmitter。
+        # 给基类用：infrared 通道下基类靠它跟踪 emitter 可用性 / 发命令；
+        # 其它通道的跟踪被 async_added_to_hass 跳过，发码走 transmitter。
         self._infrared_emitter_entity_id: str = self._tx_target
 
         self._carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
@@ -146,7 +140,7 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
-            # 型号常自带品牌（「TCL电视-1」）⇒ 别前缀出「TCL TCL电视-1」，
+            # 型号常自带品牌（「TCL电视-1」）⇒ 不能前缀出「TCL TCL电视-1」，
             # 那会把 entity_id 变成 `remote.tcl_tcl电视_1`。
             name=library.display_name(brand, device["name"]),
             manufacturer=brand,
@@ -166,7 +160,7 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose what this remote can do (helps building dashboards)."""
+        """暴露"这台遥控器能做什么"，方便做 dashboard。"""
         return {
             "ir_hub_tx_type": self._tx_type,
             "ir_hub_tx_target": self._tx_target,
@@ -181,12 +175,12 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
     # ------------------------------------------------------------------ 发射通道
 
     async def async_added_to_hass(self) -> None:
-        """infrared 通道跟随 emitter 可用性；其它通道无实体状态可跟，恒可用。"""
+        """infrared 通道跟随 emitter 可用性；其它通道无状态可跟，恒可用。"""
         if self._tx_type == TX_INFRARED:
             await super().async_added_to_hass()
 
     async def _send_command(self, command) -> None:
-        """按通道路由：infrared 走 consumer 基类；其余由 transmitter 打包发服务。"""
+        """按通道路由：infrared 走 consumer 基类；其余交给 transmitter 打包发服务。"""
         if self._tx_type == TX_INFRARED:
             await super()._send_command(command)
             return
@@ -203,16 +197,15 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
     # ------------------------------------------------------------------ 发送
 
     async def async_send_command(self, command, **kwargs: Any) -> None:
-        """Send one or more library keys to the emitter.
+        """把一到多个按键发给发射器。
 
-        `remote.send_command` 的 schema 是
-        `probatio.All(cv.ensure_list, [cv.string])`（`remote/services.py`）
+        `remote.send_command` 的 schema 是 `cv.ensure_list, [cv.string]`
         ⇒ 传裸字符串 `"vol+"` 会被包成 `["vol+"]`，不会拆成字符。
         `command: ["vol+", "vol+"]` 就是按两次音量加。
         也支持 `raw:<时序>` 直接发裸时序（不受码库限制）。
         """
-        # 本方法也可能被其它集成 / 脚本**直接调用**（那时服务 schema 不生效），
-        # 所以自己再挡一道裸字符串 —— 否则 `for k in "vol+"` 会静默拆成 4 个
+        # 本方法也可能被其它集成 / 脚本直接调用（那时服务 schema 不生效），
+        # 所以这里再挡一道裸字符串 —— 否则 `for k in "vol+"` 会静默拆成 4 个
         # 单字符键。
         if isinstance(command, str):
             command = [command]
@@ -221,9 +214,8 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
         if not keys:
             return
 
-        # remote.send_command 的 num_repeats 默认值就是 1（DEFAULT_NUM_REPEATS，
-        # 且 schema 给了默认值 ⇒ 这个 kwarg 一定存在）⇒ 不能直接拿它覆盖本集成的
-        # 配置，只有用户**显式给了 >1** 时，才让服务参数胜出。
+        # num_repeats 的 schema 默认值就是 1 ⇒ 这个 kwarg 一定存在，
+        # 不能直接拿它覆盖本集成的配置；只有用户显式给了 >1 才让服务参数胜出。
         requested = int(kwargs.get(ATTR_NUM_REPEATS, 1) or 1)
         repeats = requested if requested > 1 else self._repeats
 
@@ -248,9 +240,8 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         """`remote.turn_on` —— 默认按一次电源键。
 
-        HA 给 remote 的 turn_on/turn_off 注册的 schema（`REMOTE_SERVICE_ACTIVITY_SCHEMA`）
-        带一个可选 `activity` ⇒ 传了就用它当按键名（我们的 `activity_list` 本来
-        就是一串按键名），没传才退回 `power`。
+        turn_on/turn_off 的 schema 带一个可选 `activity` ⇒ 传了就用它当按键名
+        （activity_list 本来就是一串按键名），没传才退回 `power`。
         """
         await self.async_send_command([str(kwargs[ATTR_ACTIVITY])] if kwargs.get(ATTR_ACTIVITY) else ["power"])
 
@@ -261,7 +252,7 @@ class IrHubRemote(InfraredEmitterConsumerEntity, RemoteEntity):
     # ------------------------------------------------------------------ 内部
 
     def _timings_for(self, key: str) -> list[int]:
-        """把按键名（或 raw: 前缀）解析成带符号时序数组。"""
+        """把按键名（或 `raw:` 前缀）解析成带符号时序数组。"""
         if key.startswith(RAW_PREFIX):
             return parse_timings(key[len(RAW_PREFIX) :])
 

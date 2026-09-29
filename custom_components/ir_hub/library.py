@@ -1,18 +1,14 @@
-"""码库加载器。
+"""码库加载器：读取 `library/` 下打包好的 irext 码库。
 
-读取 `library/` 下打包好的 irext 码库：
-    index.json.gz        元数据 + 每个键的 (offset, count)
+    index.json.gz            元数据 + 每个键的 (offset, count)
     data/<category>.bin.gz   时序数据，varint(zigzag) 无损编码
 
-分块加载：只有真正用到某个类别时才解压那一个块（机顶盒原始 16 MB），
+按类别分块加载：只有真正用到某个类别时才解压那一块（机顶盒单块原始 16 MB），
 不会把全库 20 MB 常驻内存。
 
-⚠️ 存储格式的一个关键事实（自检实测，全库 12,582,610 个时序值）：
-    irext 的 `collect_key.key_value` 是**全正**的 mark/space 交替长度，
-    **不含符号**（实测负值数量 = 0）。而 ESPHome / HA 的红外体系用的是
-    "正 = pulse（载波开）、负 = space（载波空闲）"。
-    所以符号必须在**读取时**补，见 `sign_timings()`。
-    这么做的好处：3.9 MB 打包数据一个字节都不用改。
+符号约定（关键）：irext 原始数据是**全正**的 mark/space 长度，不含符号。
+而 ESPHome / HA 要求"正 = pulse、负 = space"，所以符号在**读取时**补，
+见 `sign_timings()`。这样打包数据一个字节都不用改。
 """
 
 from __future__ import annotations
@@ -34,11 +30,10 @@ CONF_KEY_ORDER = "key_order"
 
 
 def decode_varints(data: bytes, offset: int, count: int) -> list[int]:
-    """Decode `count` zigzag-varints starting at `offset`.
+    """从 `offset` 起解码 `count` 个 zigzag-varint。
 
-    与 tools/pack_irext.py 的 zigzag()/put_varint() 严格互逆
-    （自检里用打包器自己的编码器做了全库逐字节往返验证）。
-    返回的是**无符号**长度值（µs）—— 符号由 sign_timings() 补。
+    与 tools/pack_irext.py 的编码严格互逆（自检做过全库逐字节往返验证）。
+    返回的是**无符号**长度值（µs），符号由 `sign_timings()` 补。
     """
     out: list[int] = []
     i = offset
@@ -61,18 +56,16 @@ def sign_timings(values: list[int]) -> list[int]:
 
     偶数下标是 mark（载波开，正），奇数下标是 space（载波空闲，负）。
 
-    ⚠️ 这一步**不能省**：ESPHome 的 `remote_transmitter.transmit_raw` 与 HA 的
-    infrared `Command.get_raw_timings()` 都要求"正负交替"；传全正数组会被
-    `RawTimingsCommand` 直接以 "raw timings must alternate pulse/space" 拒绝，
-    也就是**一次都发不出去**（这个坑由 tools/selfcheck.py 抓出）。
+    ⚠️ 这一步不能省：ESPHome `transmit_raw` 与 HA `get_raw_timings()` 都要求
+    正负交替，传全正数组会被 `RawTimingsCommand` 以 ValueError 拒收，一次都发不出去。
 
-    帧长奇数很正常（NEC 标准帧就是 "引导码 + 32×2 位 + stop_mark"，以 mark 收尾）。
+    帧长为奇数很正常（NEC 标准帧就是"引导码 + 32×2 位 + stop_mark"，以 mark 收尾）。
     """
     return [value if index % 2 == 0 else -value for index, value in enumerate(values)]
 
 
 class CodeLibrary:
-    """Read-only view over the packaged irext code library."""
+    """码库的只读视图，进程内共享一份。"""
 
     def __init__(self, path: str = LIBRARY_DIR) -> None:
         self._path = path
@@ -108,13 +101,11 @@ class CodeLibrary:
 
     @staticmethod
     def display_name(brand_name: str, model_name: str) -> str:
-        """品牌 + 型号的展示名；型号**已自带品牌前缀**时不重复。
+        """品牌 + 型号的展示名；型号已自带品牌前缀时不重复。
 
-        ⚠️ 这条不是美化，是必须的：irext 的 `collect_remote.name` 常常已经是
-        「TCL电视-1」「格力空调-2」这种（自带品牌）。无脑 `f"{brand} {name}"`
-        会得到「TCL TCL电视-1」，而 HA 的 entity_id = slugify(设备名) ⇒
-        实体变成 `remote.tcl_tcl电视_1`（品牌重复一遍），用户每次调服务都要
-        看着这个别扭 id。
+        ⚠️ 这不是美化，是必须的：irext 的型号名常常已经带品牌（"TCL电视-1"），
+        无脑拼 `f"{brand} {name}"` 会得到 "TCL TCL电视-1"，
+        而 HA 的 entity_id 取自设备名 ⇒ 实体变成 `remote.tcl_tcl电视_1`。
         """
         brand_name = (brand_name or "").strip()
         model_name = (model_name or "").strip()
@@ -125,11 +116,7 @@ class CodeLibrary:
         return f"{brand_name} {model_name}"
 
     def categories_available(self) -> list[tuple[int, str, int]]:
-        """Categories that actually contain devices: (id, name, device_count).
-
-        Sorted biggest-first — the config flow shows them as a dropdown and the
-        big categories (机顶盒 / 电视机) are what people almost always want.
-        """
+        """有设备的类别：(id, 名称, 设备数)。按设备数从多到少排。"""
         counts: dict[int, int] = {}
         for device in self.devices:
             counts[device["category"]] = counts.get(device["category"], 0) + 1
@@ -142,10 +129,7 @@ class CodeLibrary:
         )
 
     def brands_in(self, category: int) -> list[tuple[int, str, int]]:
-        """Brands in `category`: (id, name, device_count), most-populated first.
-
-        按"型号数"排序比按拼音更实用 —— 下拉框里常有 100+ 项。
-        """
+        """该类别下的品牌：(id, 名称, 型号数)。按型号数从多到少排。"""
         seen: dict[int, int] = {}
         for device in self.devices:
             if device["category"] == category:
@@ -159,7 +143,7 @@ class CodeLibrary:
         )
 
     def devices_in(self, category: int, brand: int) -> list[dict]:
-        """Devices of one brand in one category, sorted by name."""
+        """某类别下某品牌的全部型号，按名称排序。"""
         return sorted(
             (
                 d
@@ -170,16 +154,16 @@ class CodeLibrary:
         )
 
     def get_device(self, device_id: int) -> dict | None:
+        """按 id 取设备条目。"""
         return self._by_id.get(device_id)
 
     @staticmethod
     def key_names(device: dict) -> list[str]:
-        """Sorted key names — power first, then the usual remote order.
+        """该设备可用的键名，power 等常用键排在前面。
 
-        只列**可用**的键：码长度 < 2 的在 irext 里是占位死数据（键名进了
-        key_mapping，但码就是单个 0，实测 28,022 个），列出来只会让人按了
-        没反应。打包时已剔除，这里再挡一道（判据只用索引里的 count，
-        不用解压数据块）。
+        只列**可用**的键：count < 2 的在 irext 里是占位死数据（码只有单个 0），
+        列出来只会让人按了没反应。打包时已剔除，这里再用索引里的 count 挡一道
+        （不解压数据块）。
         """
         keys = [
             name
@@ -194,16 +178,14 @@ class CodeLibrary:
         return sorted(keys, key=lambda k: (rank.get(k, len(priority)), k))
 
     def get_timings(self, device_id: int, key: str) -> list[int] | None:
-        """Return the **signed** raw timings for `key`, or None if unusable.
+        """返回某键的**带符号**裸时序；不可用时返回 None。
 
-        正 = mark，负 = space，单位 µs —— 可直接喂给
-        `ir_command.RawTimingsCommand` / ESPHome `transmit_raw`。
+        正 = mark、负 = space，单位 µs，可直接喂给 `RawTimingsCommand`。
 
         返回 None 的两种情况：
           ① 码库里没有这个键；
-          ② 有，但长度 < 2（占位死数据）。这种数组没有 space，
-             交给 emitter 会被 `RawTimingsCommand` 以 ValueError 拒收，
-             所以在这里就挡掉，而不是让它变成运行时异常。
+          ② 有，但 count < 2（占位死数据）—— 这种数组没有 space，
+             交给 emitter 会被拒收，所以在这里就挡掉，不让它变成运行时异常。
         """
         device = self._by_id.get(device_id)
         if device is None:
@@ -225,6 +207,7 @@ class CodeLibrary:
     # ---------------------------------------------------------------- 数据块
 
     def _chunk(self, category: int) -> bytes:
+        """取（并缓存）某类别的时序数据块。"""
         cached = self._chunk_cache.get(category)
         if cached is not None:
             return cached
@@ -234,11 +217,12 @@ class CodeLibrary:
         with gzip.open(full, "rb") as handle:
             data = handle.read()
 
-        # 只缓存一个块：码库是按类别分块的，同时用两个类别的场景很少，
-        # 缓存单块足以避免反复解压，又不会把 20 MB 全塞进内存。
+        # 只缓存最近一个块：同时用两个类别的场景很少，单块缓存足够避免反复解压，
+        # 又不会把 20 MB 全塞进内存。
         self._chunk_cache.clear()
         self._chunk_cache[category] = data
         return data
 
     def release(self) -> None:
+        """释放缓存的数据块。"""
         self._chunk_cache.clear()

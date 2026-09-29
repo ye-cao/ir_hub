@@ -1,42 +1,52 @@
 # IR Hub
 
-基于 **irext 码库** 的 Home Assistant 红外 `consumer` 集成 —— 自己不碰硬件，
-把码库里的码交给 infrared emitter（如 ESPHome `ir_rf_proxy`）发出去。
+Home Assistant 红外遥控集成，内置 **irext 码库**。
+
+它自己不含硬件，只负责"查码 + 发码"：把码库里的时序交给 HA 的红外发射器
+（如 ESPHome `ir_rf_proxy`）发出去。
 
 ```text
 IR Hub 实体 ─ infrared.async_send_command ─ infrared.<emitter> 实体
-  ─ aioesphomeapi (protobuf) ─ ESPHome ir_rf_proxy ─ remote_transmitter ─ IR LED
+  ─ aioesphomeapi ─ ESPHome ir_rf_proxy ─ remote_transmitter ─ IR LED
 ```
 
-## 两个平台
+## 能做什么
 
-| | 码库 | 实体 |
+| | 码库 | 生成的实体 |
 |---|---|---|
-| **电视 / 机顶盒 / 风扇…** | irext 按键码库：**13,615 设备**（collect 8,565 + 官网 decode 5,050，0.3.6 起与官网 1:1）/ 1,259 品牌 / 258,653 键 | 每设备 1 个 `remote.*` + 每键 1 个 `button.*` |
-| **⭐ 空调** | irext 状态码库：525 bin / **245 品牌 / 1507 型号**（美的/格力/TCL/海尔…全在；0.3.5 起与官网 remote_index 全量对齐，美的 18→26） | 每型号 1 个 `climate.*` 恒温器面板 |
+| 电视 / 机顶盒 / 风扇 / 音响… | 按键码库：**13,615 设备 / 1,818 品牌 / 258,653 键** | 每设备 1 个 `remote.*`，每键 1 个 `button.*` |
+| ⭐ 空调 | 状态码库：**245 品牌 / 1,507 型号**（索引引用 509 个 bin） | 每型号 1 个 `climate.*` 恒温器面板 |
 
-空调是真恒温器：模式 / 温度滑条 / 风速原生可调，重启自动恢复状态，
-**不需要 SmartIR / SmartAC**。载波 / 发送次数在集成「选项」里改，改完立即生效。
+空调是真恒温器：模式 / 温度 / 风速原生可调，重启自动恢复状态，不需要 SmartIR / SmartAC。
 
-[![HACS](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-**一键添加到 HACS**：装好 HACS 的 HA 点这里 →
-[HACS 安装 ir_hub](https://my.home-assistant.io/redirect/hacs_repository/?owner=ye-cao&repository=ir_hub&category=integration)
+## 两种添加方式
+
+添加集成时二选一：
+
+| 方式 | 怎么用 | 适合 |
+|---|---|---|
+| **手动选择** | 大类 → 品牌 → 型号 | 知道型号，或想指定具体型号 |
+| **用遥控器配对** | 拿原遥控器对准红外接收器按一下，自动在码库反查 | 不知道型号；机顶盒这类同款 OEM 遥控有几百个的情况 |
+
+配对方式需要 HA 的红外**接收**能力（见「依赖」）。按键类设备按**任意一个键**即可；
+空调按遥控器的**电源键**（同一个 bin 能生成的帧很多，实测按一个键就够定位型号）。
 
 ## 依赖
 
 | 项 | 要求 |
 |---|---|
-| Home Assistant | **≥ 2026.6.0**（`InfraredEmitterConsumerEntity` 落在 2026.6） |
-| 发射器 | 四选一，见下表；自制方案示例为 ESPHome（已验证至 2026.9.0） |
+| Home Assistant | **≥ 2026.6.0**（`InfraredEmitterConsumerEntity` 在此版本引入） |
+| 红外发射器 | 四选一，见下表 |
+| 红外接收器 | **仅"用遥控器配对"需要**。HA 的红外接收实体比发射支持更晚引入；版本不够时集成会直接提示，不会报错 |
 
-**发射通道**（添加集成时选，对齐 SmartAC 的发射器抽象——没有自制硬件也能用现成的）：
+**发射通道**（添加时选）：
 
 | 通道 | 目标 | 说明 |
 |---|---|---|
 | `infrared`（推荐） | infrared emitter 实体 | HA 官方红外体系，配 ESPHome `ir_rf_proxy` |
-| `broadlink` | `remote.*` 实体 | 现成遥控宝；µs→b64 包与 SmartAC 逐字节一致 |
+| `broadlink` | `remote.*` 实体 | 现成遥控宝；打包格式与 SmartAC 逐字节一致 |
 | `esphome` | `esphome.<动作>` | SmartAC 兼容契约（`{"command": [带符号时序]}`） |
-| `mqtt` | topic | **默认发 SmartAC 裸时序数组**（tcl-ir 等桥接固件即插即用）；选项里可切 Tasmota IRMQTTServer RAW JSON |
+| `mqtt` | topic | 默认发 SmartAC 裸时序数组；选项里可切 Tasmota IRMQTTServer RAW JSON |
 
 ESPHome 侧最小配置（仅 `infrared` 通道需要）：
 
@@ -44,7 +54,7 @@ ESPHome 侧最小配置（仅 `infrared` 通道需要）：
 remote_transmitter:
   id: ir_tx
   pin: GPIO4
-  carrier_duty_percent: 50%     # ⚠️ 必须是中间值，0/100 会被拒
+  carrier_duty_percent: 50%     # 必须是中间值，0/100 会被拒
   non_blocking: true
 
 infrared:
@@ -57,36 +67,39 @@ infrared:
 
 ### 方式一：HACS（推荐）
 
-1. HA 里先装好 [HACS](https://hacs.xyz) 本身（设置 → 设备与服务 → HACS，首次会要求授权 GitHub）。
+1. HA 里先装好 [HACS](https://hacs.xyz)（设置 → 设备与服务 → HACS，首次需授权 GitHub）。
 2. 添加本仓库，二选一：
-   - **点这个链接直达**（需已配置 My Home Assistant）：
+   - 点链接直达（需已配置 My Home Assistant）：
      [HACS 添加 ir_hub](https://my.home-assistant.io/redirect/hacs_repository/?owner=ye-cao&repository=ir_hub&category=integration)
-   - 或手动：**HACS → 右下角「自定义存储库」** → 仓库填 `ye-cao/ir_hub`、类别选 **Integration** → 添加 → 点 **下载**。
+   - 或手动：**HACS → 右下角「自定义存储库」** → 仓库填 `ye-cao/ir_hub`、类别选 **Integration** → 添加 → 下载。
 3. 重启 Home Assistant。
 4. 设置 → 设备与服务 → 添加集成 → 搜 **IR Hub**。
 
-> 之后有新版本，HACS 页面会出现更新提示，点更新 + 重启即可。
+> 有新版本时 HACS 页面会提示，点更新 + 重启即可。
 
 ### 方式二：离线安装
 
 1. 下载仓库（Code → Download ZIP，或 `git clone https://github.com/ye-cao/ir_hub.git`）。
-2. 把其中的 `custom_components/ir_hub/` **整个目录**拷到 HA 的
-   `config/custom_components/ir_hub/`（最终结构：`config/custom_components/ir_hub/manifest.json` 存在）。
+2. 把 `custom_components/ir_hub/` **整个目录**拷到 HA 的 `config/custom_components/ir_hub/`
+   （拷完应存在 `config/custom_components/ir_hub/manifest.json`）。
 3. 重启 Home Assistant → 添加集成 → 搜 **IR Hub**。
 
-> HA 在容器/虚拟机里跑的，注意把目录拷进**容器内**的 `/config`（Samba / File editor 插件均可）。
+> HA 跑在容器/虚拟机里时，注意拷进**容器内**的 `/config`（Samba 或 File editor 插件均可）。
 
-添加流程：选发射通道 + 目标 → 大类 → 品牌 → 型号 → **实测确认**（自动发测试码：设备=电源键；**空调=两段式**，先发开机帧再发关机帧，都有反应才建 entry——空调关着时只发关机码是看不出反应的）。没反应可「自动试下一个型号」（机顶盒这类多型号品牌不用逐个回下拉重选，试完全部自动停），人不在旁边可跳过。**所有设备大类都有实测环节**。
+## 添加流程都带实测确认
 
-> 中文设备名会被 slugify 成拼音：`TCL电视-1` → `remote.tcldian_shi_1`。
-> 拿不准就去「开发者工具 → 状态」按前缀筛，别照中文猜。
+不管手动还是配对，**最后都会真发一帧码让你确认设备有反应**才建 entry —— 避免"加错了删掉重来"。
+
+- 按键类设备：发 `power` 键。没反应可以「自动试下一个型号」（机顶盒这类多型号品牌不用逐个回下拉重选，试完全部自动停），人不在设备旁可跳过。
+- 空调：**两段式**，先发开机帧再发关机帧。只发关机码的话，空调本来就关着，看不出任何反应。
+  配对找出来的型号也走这一步；没反应退回候选列表换一个（不用重新按遥控器）。
 
 ## 用法
 
-**空调**：得到 `climate.*` 后直接用恒温器卡片；每次调温度/模式/风速发一帧
-全状态码（美的类协议自动连发 3 帧）。两次操作间隔 ≥1 秒。
+**空调**：得到 `climate.*` 后用恒温器卡片。每次调温度/模式/风速会发一帧全状态码
+（美的类协议自动连发 3 帧）。两次操作间隔 ≥ 1 秒。
 
-**电视/机顶盒** —— 每个可用键已自动生成 button，dashboard 点一下即发：
+**电视 / 机顶盒**：每个可用键已生成 button，dashboard 点一下即发：
 
 ```yaml
 type: grid
@@ -101,9 +114,6 @@ cards:
   - type: button
     entity: button.tcldian_shi_1_vol_minus
 ```
-
-> `+`/`-` 在 entity_id 里映射为 `plus`/`minus`（裸 slugify 会把 `vol+`/`vol-`
-> 都压成 `vol` 而撞名）；显示名仍保留原始 `vol+`。同见 `page+/-`、`brightness+/-`。
 
 或者只用 remote 实体调服务（可一次多个键）：
 
@@ -120,55 +130,114 @@ data:
 service: ir_hub.send_raw
 data:
   emitter: infrared.<你的发射器实体>
-  timings: "3963 -3985 491 -1990"   # 也接受列表；正=载波 负=空闲，µs
+  timings: "3963 -3985 491 -1990"   # 也接受列表；正 = 载波，负 = 空闲，单位 µs
   carrier: 38000
   repeats: 1
 ```
+
+### 实体命名
+
+中文设备名会被 slugify 成拼音：`TCL电视-1` → `remote.tcldian_shi_1`。
+拿不准就去「开发者工具 → 状态」按前缀筛，别照中文猜。
+
+`+` / `-` 在 entity_id 里映射为 `plus` / `minus`（裸 slugify 会把 `vol+`、`vol-` 都压成 `vol` 而撞名）；
+显示名仍保留原始 `vol+`。同见 `page+/-`、`brightness+/-`。
 
 ## 选项与排障
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| 载波频率 (Hz) | 38000 | **别信码库协议名**——实测 TCL 电视标"RCA (56K)"却是 38 kHz 才响。设备没反应就换 38000 / 40000 / 56000 试 |
-| 发送次数 | 1 | HA 的 esphome emitter 会丢弃 `repeat_count`，故在时序层复制实现 |
+| 载波频率 (Hz) | 38000 | **别信码库里的协议名** —— 本机 TCL 电视标"RCA (56K)"，实测却是 38 kHz 才响。设备没反应就换 38000 / 40000 / 56000 试 |
+| 发送次数 | 1 | HA 的 esphome emitter 会丢弃 `repeat_count`，所以在时序层复制实现 |
 | Broadlink 延迟 | 0.5 秒 | 仅 Broadlink 通道有效（`remote.send_command` 的 `delay_secs`） |
+| MQTT 载荷格式 | smartac | 仅 MQTT 通道有效 |
 
-空调排障顺序：① 换载波试 → ② 换同品牌其它型号 bin → ③ 检查发射强度
-（直驱 LED 建议三极管驱动，`drive_strength: 40mA` 可拉满 GPIO 能力）。
+设备没反应时的排查顺序：① 选项里换载波 → ② 换同品牌其它型号 → ③ 检查发射强度
+（直驱 LED 建议加三极管，ESP32 可把 `drive_strength` 拉到 40mA）。
+
+### 配对方式能用多快
+
+按键类设备的代价主要在**建该大类的特征索引**（第一次用才建，之后常驻内存）：
+
+| 大类 | 首次识别 | 同进程再识别 |
+|---|---|---|
+| 机顶盒（最大类） | ~9 秒 | ~1 秒 |
+| 电视机 | ~6 秒 | ~2 秒 |
+| 风扇 / 音响 / 投影仪 / DVD | < 1 秒 | < 0.3 秒 |
+
+按两个键比只按一个键更准：两个键的候选取交集，能把同款 OEM 遥控（码库里几十上百个同码型号）收敛掉大半。
+第二键可以跳过。
+
+空调走另一套路子（详见下节）：先按**结构指纹**（帧长 + 引导码）把 509 个 bin 筛到 30 个上下再逐帧打分。
+指纹建一次约 0.5 秒，之后单次识别均值约 1.2 秒（最慢 4 秒出头）。同样支持第二键取交集。
+
+### 空调是怎么配对的
+
+按键设备"一键 = 一帧定长码"，直接比就行。空调不是：一个 `.bin` 描述的是一台机器**整套**
+编码规则，帧要按 `[模式][风速][温度]` 现场生成，全库枚举出来有十几万帧。
+
+所以配时分两级：
+
+1. **结构指纹预筛** —— 每个 bin 只生成 1 帧，取 `(帧长, 首个 mark)`。同一台空调的所有状态帧
+   这两项恒定（全库 509 bin 实测**零例外**），所以拿捕获帧比一下就能筛掉九成（实测 509 → 中位 27）。
+2. **逐帧打分** —— 只对留下的 bin 把帧一帧帧生成出来比（每台最多 301 帧），按相似度排序。
+
+结果就是**型号列表**（不是键列表）。同一协议族的近似型号会一起冒出来（它们的码只差几个 bit），
+所以：**按品牌挑一个，集成会先发开机帧、再发关机帧让你确认**；没反应退回列表换一个
+（配对路径的「自动试下一个」就是"下一个匹配候选"，不用重新按遥控器）。
+
+> 码库里大量型号是**多品牌共用**的通用码（509 个 bin 里 149 个，最多的一个被 216 个品牌共用）。
+> 从 bin 反查不出"你这台是什么牌子"，所以配对出来的候选会标成「空调 11272（79 个品牌共用）」，
+> entry 名也只叫「空调 11272」—— 不挑一个品牌来冒充。
+> 手动选择路径的品牌是你自己点的，照旧写成「美的 空调 11272」。
+
+> 实测（`tools/verify_learn_ac.py`，120 个真实 bin 注入 ±8% 接收抖动 + 10% 丢首元素）：
+> 真型号在候选前 8 里 **120/120 = 100%**，排名第 1 的 85.8%；两键取交集仍 100% 留住真型号；
+> 结构指纹零误杀、结构不变式零违反。
 
 ## 码库说明
 
-- 双数据源（0.3.4 起）：**collect 路径**（collect_remote × collect_key，用户上传采集码，中文名）
-  + **decode 路径**（remote_index × decode_remote，官方解码库 = 官网 code 页的"控制码"，
-  英文名如 `remote_iptv_dxmh`，设备 id = 索引 id + 100000）。
-  **0.3.6 起按官网基准 1:1**：remote_index 每行独立成条，不再做签名去重
-  （此前 1,848 条重复被合并，品牌下型号数与官网对不上）；重复条目信号
-  逐值相同，gzip 仅 +0.4 MB。
-- 按键库已清理：剔除占位键 30,065 / 重复键 2,998（判据由 `tools/selfcheck.py` 守着）。
-  存储 4.62 MB gzip 按类别分块（16 类），运行时只解压用到的一块。**IPTV（电信魔盒等
-  运营商盒子）在「IPTV」大类**，此前整类缺失 0.3.4 已补全。
-  - 空调状态码库 525 bin（0.3.5 起按官方 irext-binaries 全量对齐；官方 zip 中 22 个损坏 bin 已剔除）在 `ac_library/`，解码器移植自
-  [SmartAC](https://github.com/ryanh7/SmartAC)（irext 官方 `ir_decode.c` 的 Python 移植，MIT）。
-- irext 按键码存的是无符号长度，符号在读取时补——漏了这步会被
-  `RawTimingsCommand` 以"全正数组"拒收，一次都发不出去。
+**两个来源**合成一份按键库：
+
+- **collect**（8,565 设备）：用户上传的采集码，中文名。
+- **decode**（5,050 设备）：官方解码库，即官网 code 页的"控制码"，英文名。
+  设备 id = 索引 id + 100000。
+
+按官网基准 1:1 入库（remote_index 每行独立成条，不做签名去重 —— 否则品牌下型号数与官网对不上；
+重复条目信号逐值相同，gzip 只多 0.4 MB）。存储 4.7 MB，按 16 个类别分块，运行时只解压用到的那一块。
+
+**空调**用的是另一套状态码库（`ac_library/`，索引引用 509 个 bin），解码器移植自
+[SmartAC](https://github.com/ryanh7/SmartAC)（irext 官方 `ir_decode.c` 的 Python 移植，MIT）。
+
+> 两份都只存**无符号长度**，符号在读取时按"偶 mark / 奇 space"补。漏了这步会得到全正数组，
+> 被 `RawTimingsCommand` 直接拒收，一次都发不出去。
 
 ## 自检
 
-开发机直跑（不依赖 HA，约 30 秒）：
+开发机直跑，不依赖 HA，约 1 分钟：
 
 ```bash
 python tools/selfcheck.py
 ```
 
-**189 项**：全库每键 varint 逐字节往返（不抽样）、符号交替不变式、AC 全库
-525 bin 全量解码回归（0 失败）、remote/button/climate/config_flow 真逻辑单测
-（stub homeassistant）、翻译键与 flow 的一致性。末尾 `expected_total` 护栏
-保证没有任何检查段被静默跳过。发布形态下 2 项需要仓库外文件的检查自动跳过。
+**236 项**，覆盖：
+
+- 全库每个键的 varint **逐字节往返**（用打包器自己的编解码重编比对，不抽样）
+- 符号交替不变式（保证发得出去）
+- 空调全库 509 bin（索引引用的全部型号）全量解码回归
+- `remote` / `button` / `climate` / `config_flow` 的真逻辑单测（stub 掉 homeassistant）
+- 翻译键与 config_flow 用到的键一一对应
+- 学习匹配引擎的不变式（符号规整、丢引导码对齐、分数不饱和）
+- 空调配对全链路（选空调大类 → 捕获电源键 → 候选列表 → 两段式实测 → 退回候选 → 建 entry）
+
+末尾有 `expected_total` 项数护栏：**任何一段检查被静默跳过都会报错**，所以"全部通过"这个结论本身可信。
 
 ## 已知边界
 
-- **红外是单向的**：没有状态回读，remote 的 state 恒为 unknown；
-  climate 的状态是"最后发送的状态"，物理遥控器的操作不会同步进来。
-- 码库只有 irext 收录的设备；没有的用 `ir_hub.send_raw` 或
-  `remote.send_command` 的 `raw:` 前缀手发时序。
-- emitter 掉线自动跟随（一起 unavailable，上线自愈），无需重加集成。
+- **红外是单向的**：没有状态回读。`remote` 的 state 恒为 unknown；`climate` 的状态是"最后发送的状态"，
+  用物理遥控器操作不会同步进来。
+- 码库只覆盖 irext 收录的设备。没有的可以用 `ir_hub.send_raw` 手发时序。
+- emitter 掉线会自动跟随（一起 unavailable，上线自愈），不需要重加集成。
+- 配对方式只对**同一个大类内**做反查：先选大类（按键类某个类别，或「空调」），再按遥控器。
+  空调的候选是"型号"，同一个协议族常有几十个近似型号一起出现 —— 按品牌挑一个，再靠两段式实测确认；
+  多品牌共用的通用码会标出共用品牌数。

@@ -2,10 +2,11 @@
   "config": {
     "step": {
       "user": {
-        "title": "IR Hub — 选择发射通道",
-        "description": "内置码库：{devices} 台设备 + 1053 个空调型号。\n\n选一个发射通道：有自制 ESPHome 红外就用 infrared（推荐）；没有动手硬件也可以用现成的 Broadlink 遥控宝、刷了 Tasmota IRMQTTServer 的 MQTT 网关，或任何暴露了 ESPHome 动作的发射器（SmartAC 兼容）。",
+        "title": "IR Hub — 选择发射通道与配置方式",
+        "description": "内置码库：{devices} 台按键设备 + 一整套空调状态码库。\n\n**发射通道**：有自制 ESPHome 红外就用 infrared（推荐）；没有动手硬件也可以用现成的 Broadlink 遥控宝、刷了 Tasmota IRMQTTServer 的 MQTT 网关，或任何暴露了 ESPHome 动作的发射器（SmartAC 兼容）。\n\n**配置方式**：手动选择 = 按 大类→品牌→型号 逐级挑；用遥控器配对 = 拿**原来的遥控器**对准红外接收器按一下，自动在码库里反查（按键设备与空调都支持；不知道型号时快得多）。",
         "data": {
-          "tx_type": "发射通道"
+          "tx_type": "发射通道",
+          "mode": "配置方式"
         }
       },
       "tx": {
@@ -37,6 +38,41 @@
           "test_result": "设备有反应吗？"
         }
       },
+      "learn_setup": {
+        "title": "IR Hub — 用遥控器配对：选接收器与大类",
+        "description": "通道：**{tx_type}**\n发射目标：{tx_target_hint}\n\n选**红外接收器**（码库日期：{generated}）和**设备大类**。\n\n⚠️ 配对时请把原遥控器对准接收器、距离 5~30 cm；大类务必选对（匹配是**在该大类内**做的，选错大类就找不到码）。空调同样支持配对：选「空调 · 温控面板」，然后按空调遥控器的**电源键**即可。",
+        "data": {
+          "tx_target": "发射目标",
+          "receiver": "红外接收器",
+          "category": "设备大类"
+        }
+      },
+      "learn_press": {
+        "title": "IR Hub — 第 {seq} 键：请按遥控器",
+        "description": "接收器：**{receiver}**\n\n请把原遥控器对准接收器，按一下 **{key_hint}**，然后点下面的「提交」。\n\n（已收到 {captured} 帧；没收到就再按一次再提交。）",
+        "data": {}
+      },
+      "learn_press2": {
+        "title": "IR Hub — 第 {seq} 键（可选）：再按一个键收敛型号",
+        "description": "接收器：**{receiver}**\n\n再按一下 **{key_hint}** 然后提交 —— 两个键的结果取交集，能把同码 / 近似码的型号收敛掉大半（空调尤其明显：同协议族的型号单靠电源键分不开）。\n\n懒得按就选「跳过」，只用电源键匹配（候选会更多）。已收到 {captured} 帧。",
+        "data": {
+          "learn_action": "下一步"
+        }
+      },
+      "learn_pick": {
+        "title": "IR Hub — 确认匹配到的型号",
+        "description": "在 **{category}** 里匹配到 **{count}** 个候选型号（{keys}，最高相似度 {score}）。\n\n候选按相似度排序，挑你自己的品牌 / 型号。同一协议族的型号会一起出现（它们的码几乎一样，随便挑一个通常都能用），能挑到品牌一致的最好；标着「N 个品牌共用」的是**通用码**，不是配错了。\n\n选完下一步会发一帧实测码确认（空调是「先开机、再关机」两段确认）。",
+        "data": {
+          "device": "型号"
+        }
+      },
+      "learn_test": {
+        "title": "IR Hub — 发送实测码确认",
+        "description": "**已向 {model} 发送测试码（按键：{key}）**。\n\n有反应就选「有反应」完成添加；没反应选「退回重选候选」（换一个相似度低一点的候选再试）。",
+        "data": {
+          "test_result": "设备有反应吗？"
+        }
+      },
       "ac_brand": {
         "title": "IR Hub — 选择空调品牌",
         "description": "空调使用 irext 状态码库（共 {count} 个品牌 / {devices} 个型号）。\n\n选品牌后下一步选型号，创建后将得到**真正的恒温器面板**（模式/温度/风速原生可调），无需 SmartIR/SmartAC。",
@@ -53,14 +89,14 @@
       },
       "ac_test_on": {
         "title": "IR Hub — 发送空调开机测试码",
-        "description": "**已向 {brand}（第 {index}/{total} 个：型号 {model}）发送一帧开机码（26°C / 自动风）**。\n\n空调有「滴」一声或开始出风就选「有反应」，接着会再发一帧关机码做二次确认；没反应可「自动试下一个型号」或退回重选；人不在旁可「跳过」。",
+        "description": "**已发出开机码（{brand} · 第 {index}/{total} 个候选：型号 {model}，26°C / 自动风）**。\n\n空调有「滴」一声或开始出风就选「有反应」，接着会再发一帧关机码做二次确认；没反应可「自动试下一个型号」或退回重选；人不在旁可「跳过」。",
         "data": {
           "test_result": "空调开机了吗？"
         }
       },
       "ac_test": {
         "title": "IR Hub — 发送空调关机测试码",
-        "description": "**已向 {brand}（第 {index}/{total} 个：型号 {model}）发送一帧关机码**。\n\n空调有「滴」一声或关机反应就选「有反应」完成添加；没反应可以「自动试下一个型号」或退回重选。人不在空调旁可选「跳过」。",
+        "description": "**已发出关机码（{brand} · 第 {index}/{total} 个候选：型号 {model}）**。\n\n空调有「滴」一声或关机反应就选「有反应」完成添加；没反应可以「自动试下一个型号」或退回重选。人不在空调旁可选「跳过」。",
         "data": {
           "test_result": "空调关机了吗？"
         }
@@ -73,13 +109,17 @@
       "no_devices": "该品牌的码库里没有型号。",
       "device_gone": "该型号已不在码库中。",
       "ac_decode_failed": "该型号的码库数据无法解码（irext 数据缺损）。请换一个型号试试。",
-      "test_exhausted": "品牌内的型号都试完了还没有反应 —— 检查发射器对准设备/载波频率（选项里换 56k 试试），或换个品牌再试。"
+      "test_exhausted": "品牌内的型号都试完了还没有反应 —— 检查发射器对准设备/载波频率（选项里换 56k 试试），或换个品牌再试。",
+      "no_receivers": "没有找到可用的红外接收器。请先在 ESPHome 里给设备加一个接收实体（`ir_rf_proxy` 的 `infrared:` 项，或 `remote_receiver` + infrared 平台），再重新加载本集成。",
+      "receiver_api_missing": "当前 Home Assistant 版本的 infrared 集成还没有「接收端」API（接收支持是 2026.4 引入发射端之后才补齐的）。请升级 Home Assistant 到带红外接收实体的版本，或改用「手动选择码库」。",
+      "learn_no_match": "在所选大类里没有匹配到任何型号。检查：① 大类是否选对（匹配只在该大类内做）；② 遥控器是否对准接收器（5~30 cm）；③ 该码库是否收录了这只遥控（可换「手动选择」按品牌找找看）。"
     },
     "error": {
       "send_failed": "测试码发送失败（发射器不在线或拒发）。可稍后重试、跳过测试，或退回重选。",
       "no_test_key": "该型号的码库里没有可用的测试码。可直接跳过测试完成添加。",
       "target_missing": "发射目标不存在或不可用（实体不在线 / ESPHome 动作未注册 / Broadlink 实体不存在），请检查后重填。",
-      "mqtt_missing": "MQTT 集成未加载 —— 请先在 HA 里配置 MQTT（broker），再选 MQTT 通道。"
+      "mqtt_missing": "MQTT 集成未加载 —— 请先在 HA 里配置 MQTT（broker），再选 MQTT 通道。",
+      "no_signal": "没有捕获到红外信号。请把遥控器**对准接收器**（5~30 cm）再按一次，然后重新提交；确认电池有电、大类不用重选。"
     }
   },
   "options": {

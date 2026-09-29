@@ -1,5 +1,6 @@
-# 一次性诊断：IR Hub ac_library vs SmartAC irext —— 同一 bin 差分对比
-# 用完即删。跑法: venv python tools/diff_ac_decode.py
+# 诊断工具：同一个 AC bin 分别用 IR Hub 与 SmartAC 的 irext 解码器展开，逐项对比。
+# 用途：空调按键无反应时，先确认两边生成的帧到底一致不一致（定位根因方向）。
+# 跑法：<venv>/python tools/diff_ac_decode.py
 import json
 import os
 import sys
@@ -43,6 +44,7 @@ print(f"IR Hub cool26 len={len(hub_cool26)}  SmartAC cool26 len={len(sa_cool26)}
 
 
 def cmp(name, a, b):
+    """逐项比较，不一致时打印首个差异点附近的上下文。"""
     if a == b:
         print(f"[SAME] {name} ({len(a)} 项)")
         return True

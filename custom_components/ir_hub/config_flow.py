@@ -1,18 +1,18 @@
-"""Config flow / Options flow for IR Hub.
+"""Config flow / Options flow。
 
-添加流程（四步表单）：
-    1. user    —— 选**发射通道**（infrared / esphome / broadlink / mqtt，
-                  对齐 SmartAC 的发射器抽象，让没有自制硬件的用户也能用）
+添加流程（多步表单）：
+
+    1. user    —— 选**发射通道**（infrared / esphome / broadlink / mqtt）
+                  和配置方式（手动挑码库 / 用遥控器配对）
     2. tx      —— 按通道填发射目标 + 选设备大类（空调 / 电视机 / 机顶盒 …）
     3. brand   —— 选品牌
     4. device  —— 选型号
-    5. test    —— **发一帧实测码**（设备=power 键；空调=关机帧），用户确认
-                  设备有反应才建 entry；没反应退回第 4 步重选，不生成废 entry
-                  （对齐 SmartAC 的"测试通过才加入"体验）
+    5. test    —— **发一帧实测码**（设备 = power 键；空调 = 开机 → 关机两段），
+                  用户确认有反应才建 entry；没反应可退回重选或自动试下一个型号
 
-建完之后，`remote.<品牌>_<型号>`（或空调的 `climate.*`）就出现了；按键名即
-activity_list。载波频率、发送次数、Broadlink delay 在 **选项** 里改
-（OptionsFlow）—— "38k 还是 56k" 只能靠实测定，留个不用重加集成的开关很重要。
+建完之后出现 `remote.<品牌>_<型号>`（空调是 `climate.*`），按键名即 activity_list。
+载波频率、发送次数、Broadlink delay 在**选项**里改 —— "38k 还是 56k" 只能靠实测定，
+留个不用重加集成的开关很重要。
 """
 
 from __future__ import annotations
@@ -52,10 +52,19 @@ from .const import (
     TX_TYPES,
 )
 from .ir_command import build_raw_command
+from .learn_match import match_timings, normalize_capture
+from .learn_match_ac import match_ac
 from .library import CodeLibrary
 from .transmitter import async_send_timings, async_validate_target
 
 _LOGGER = logging.getLogger(__name__)
+
+# 学习模式依赖 HA infrared 的**接收端** API（2026.4 只引入了发射端，接收端是后续
+# 版本才补的）。老版本 HA 下做特性探测，学不了就明确告知，而不是抛 AttributeError。
+_HAS_RECEIVER_API = all(
+    hasattr(infrared, name)
+    for name in ("async_get_receivers", "async_subscribe_receiver")
+)
 
 # 实测确认步的下拉选项（`vol.In(字典)`：key 是提交值，value 是显示文本）。
 # "skip" 留给"人不在设备旁 / 发射器还没上电"的场合 —— 不强制。
@@ -86,6 +95,39 @@ TX_TYPE_OPTIONS = {
     TX_MQTT: "MQTT（默认发 SmartAC 裸时序数组，填 topic）",
 }
 
+# ----------------------------------------------------------- 配置方式（第 1 步选）
+# 保留原来的"逐级挑码库"（browse），另加"拿原遥控器按键自动找码"（learn）。
+CONF_MODE = "mode"
+MODE_BROWSE = "browse"
+MODE_LEARN = "learn"
+MODE_OPTIONS = {
+    MODE_BROWSE: "手动选择码库（大类 → 品牌 → 型号，然后发测试码确认）",
+    MODE_LEARN: "用遥控器配对（对准红外接收器按一下电源键，自动在码库里找）",
+}
+
+# ----------------------------------------------------------- 学习模式专用
+CONF_RECEIVER = "receiver"
+CONF_LEARN_ACTION = "learn_action"
+LEARN_ACTION_NEXT = "next"
+LEARN_ACTION_SKIP = "skip"
+LEARN_ACTION_OPTIONS = {
+    LEARN_ACTION_NEXT: "按完了，继续（用两键结果收敛型号）",
+    LEARN_ACTION_SKIP: "跳过（只用电源键匹配）",
+}
+
+# 学习测试步的下拉（学习模式没有"品牌内下一个型号"的概念，去掉 next）
+LEARN_TEST_OPTIONS = {
+    TEST_OK: "有反应，完成添加",
+    TEST_RETRY: "没反应，退回重选候选",
+    TEST_SKIP: "跳过测试，直接添加",
+}
+
+# 学习匹配：显示多少帧候选、最多给用户多少设备候选。
+# 8 帧既够召回又不会让下拉爆炸（双键交集下电视机 ≤108 个设备，其余更少）。
+# 空调走状态码库（learn_match_ac），候选是"型号"而不是"帧"，所以不截 top_n，
+# 按相似度排序后截到 _LEARN_MAX_CANDIDATES 展示。
+_LEARN_TOP_N = 8
+_LEARN_MAX_CANDIDATES = 60
 # 各通道目标字段的表单提示（description_placeholders 用）
 _TX_TARGET_LABELS = {
     TX_INFRARED: "下拉选择 infrared 发射器实体",
@@ -96,7 +138,7 @@ _TX_TARGET_LABELS = {
 
 
 class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Add one remote (码库设备 + 发射通道的组合)。"""
+    """添加一台遥控（码库设备 + 发射通道的组合）。"""
 
     VERSION = 1
 
@@ -115,6 +157,19 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._ac_candidates: list[str] = []
         self._ac_index: int = 0
         self._ac_code: dict | None = None
+        # 该 bin 被几个品牌共用（手动路径恒为 1 —— 品牌是用户自己选的；配对路径
+        # 反查得到的是"其中一个"品牌，多品牌时必须说成共用码，不能冒认一个牌子）
+        self._ac_brand_count: int = 1
+        # ---- 学习模式状态 ----
+        self._receiver: str = ""
+        self._learn_unsub = None
+        self._learn_captures: list[tuple[list[int], int | None]] = []
+        self._learn_capture1: list[int] | None = None
+        self._learn_capture2: list[int] | None = None
+        self._learn_candidates: list | None = None   # int（按键类 id）或 str（空调 bin）
+        self._learn_top_score: float = 0.0
+        self._learn_used_two_keys: bool = False
+        self._from_learn: bool = False               # 是否由"配对"分支进的空调实测步
 
     # ------------------------------------------------------------------ 工具
 
@@ -141,27 +196,38 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._ac_library = await self.hass.async_add_executor_job(AcLibrary)
         return self._ac_library
 
-    def _async_category_schema(self) -> vol.Schema:
-        """设备大类下拉（含 AC 特殊项）—— 各通道表单共用。"""
+    def _category_options(self) -> dict[str, str]:
+        """设备大类下拉选项（含空调）—— 手动 / 配对两种流程共用。"""
         library = self._library
         assert library is not None
-        categories = {
-            str(cid): f"{name}（{count} 台）"
-            for cid, name, count in library.categories_available()
-        }
         ac_library = self._ac_library
         assert ac_library is not None
-        categories = {
+        return {
             CATEGORY_AC: (
                 f"空调 · 温控面板（{ac_library.brand_count} 品牌 / "
                 f"{ac_library.device_count} 型号）"
             ),
-            **categories,
+            **{
+                str(cid): f"{name}（{count} 台）"
+                for cid, name, count in library.categories_available()
+            },
         }
+
+    def _category_label(self) -> str:
+        """当前所选大类的显示名（配对流程的占位符用）。"""
+        if self._category == CATEGORY_AC:
+            return "空调"
+        library = self._library
+        if library is None:
+            return str(self._category)
+        return library.categories.get(self._category) or str(self._category)
+
+    def _async_category_schema(self) -> vol.Schema:
+        """设备大类下拉（含 AC 特殊项）—— 各通道表单共用。"""
         return vol.Schema(
             {
                 vol.Required(CONF_TX_TARGET): self._tx_target_validator(),
-                vol.Required(CONF_CATEGORY): vol.In(categories),
+                vol.Required(CONF_CATEGORY): vol.In(self._category_options()),
             }
         )
 
@@ -182,18 +248,25 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # ------------------------------------------------------------- 第 1 步
 
     async def async_step_user(self, user_input: dict | None = None):
-        """选发射通道。"""
+        """选发射通道 + 配置方式（手动挑码库 / 用遥控器配对）。"""
         await self._async_library()
         await self._async_ac_library()
 
         if user_input is not None:
             self._tx_type = user_input[CONF_TX_TYPE]
+            # .get 兜底：HA 升级时正开着的旧流程不带这个新字段，
+            # 直接取会 KeyError 崩掉用户手上的对话框。
+            if user_input.get(CONF_MODE, MODE_BROWSE) == MODE_LEARN:
+                return await self.async_step_learn_setup()
             return await self.async_step_tx()
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema(
-                {vol.Required(CONF_TX_TYPE, default=TX_INFRARED): vol.In(TX_TYPE_OPTIONS)}
+                {
+                    vol.Required(CONF_TX_TYPE, default=TX_INFRARED): vol.In(TX_TYPE_OPTIONS),
+                    vol.Required(CONF_MODE, default=MODE_BROWSE): vol.In(MODE_OPTIONS),
+                }
             ),
             description_placeholders={
                 "devices": str(len((await self._async_library()).devices))
@@ -279,9 +352,8 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             device = library.get_device(device_id)
             if device is None:
                 return self.async_abort(reason="device_gone")
-            # ⭐ 不直接建 entry —— 先去 test 步发一帧实测码，确认设备有反应
-            #    再落库，避免"加错了删掉重来"。
-            #    同时记下品牌内全部候选：test 步"没反应"可以自动试下一个型号。
+            # 不直接建 entry —— 先去 test 步发一帧实测码确认。同时记下品牌内全部
+            # 候选，让 test 步"没反应"时能自动试下一个型号。
             self._device_id = device_id
             self._key_candidates = [int(d["id"]) for d in library.devices_in(self._category, self._brand)]
             self._key_index = (
@@ -316,12 +388,11 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # ------------------------------------------------------- 发送实测（第 4 步）
 
     async def async_step_test(self, user_input: dict | None = None):
-        """发一帧实测码让用户确认 —— 有反应才建 entry，没反应退回重选。
+        """发一帧实测码让用户确认 —— 有反应才建 entry，没反应可退回重选。
 
-        对齐 SmartAC 的体验：码库选型只是"候选"，**设备真响应了才算数**。
-        测试键取 power（key_names 已把 power 排第一），没有 power 就取
-        第一个可用键。"next" = 自动前进到品牌内下一个型号再发（机顶盒这类
-        型号多的品牌不用逐个回下拉重选）。
+        码库选型只是"候选"，**设备真响应了才算数**。测试键取 power
+        （key_names 已把 power 排第一），没有 power 就取第一个可用键。
+        "next" = 自前进到品牌内下一个型号再发（型号多的品牌不用逐个回下拉重选）。
         """
         library = await self._async_library()
         brand_name = library.brands.get(self._brand) or f"品牌 {self._brand}"
@@ -375,7 +446,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _async_finish_device(self, library: CodeLibrary, device: dict):
-        """建普通设备的 entry（型号常自带品牌 ⇒ display_name 去重前缀）。"""
+        """建普通设备的 entry（型号常自带品牌 ⇒ display_name 去前缀）。"""
         brand_name = library.brands.get(self._brand) or f"品牌 {self._brand}"
         return self.async_create_entry(
             title=library.display_name(brand_name, device["name"]),
@@ -408,7 +479,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # ------------------------------------------------------- AC 专用步骤
 
     async def async_step_ac_brand(self, user_input: dict | None = None):
-        """空调分支：选品牌（来自 irext 状态码库，233 家）。"""
+        """空调分支：选品牌（来自 irext 状态码库）。"""
         ac_library = await self._async_ac_library()
 
         if user_input is not None:
@@ -435,13 +506,13 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_ac_device(self, user_input: dict | None = None):
-        """空调分支：选型号 bin 并建 entry（建完出 climate 实体）。"""
+        """空调分支：选型号 bin；解码通过后进实测步。"""
         ac_library = await self._async_ac_library()
 
         if user_input is not None:
             bin_name = user_input[CONF_DEVICE]
-            # ⭐ 建 entry 前先解码一遍：坏 bin 在这里挡住（带原因 abort），
-            #    不要等平台 setup 时才静默失败。解码结果留给 ac_test 步发测试码。
+            # 先解码一遍：坏 bin 在这里带原因 abort，不要等平台 setup 时才静默失败。
+            # 解码结果留给 ac_test 步发测试码。
             try:
                 self._ac_code = await self.hass.async_add_executor_job(
                     ac_library.load_device, bin_name
@@ -477,7 +548,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _ac_on_frame(self) -> list[int]:
-        """开机实测帧：mode/fan 优先 auto、温度优先 26（SmartAC async_test 同款选择）。"""
+        """开机实测帧：mode/fan 优先 auto、温度优先 26（SmartAC 同款选帧逻辑）。"""
         commands = (self._ac_code or {}).get("commands") or {}
         if not commands:
             return []
@@ -488,31 +559,51 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         temp_key = "26" if "26" in temps else next(iter(temps))
         return list(temps[temp_key])
 
+    async def _ac_advance(self, ac_library: AcLibrary) -> bool | None:
+        """「自动试下一个型号」：切到下一个候选并解码。
+
+        True = 已切好；False = 没有下一个了；None = 新 bin 解码失败。
+        """
+        nxt = self._ac_index + 1
+        if nxt >= len(self._ac_candidates):
+            return False
+        self._ac_index = nxt
+        self._ac_bin = self._ac_candidates[nxt]
+        if self._from_learn:
+            # 配对路径的候选跨品牌 ⇒ 品牌 / 共用数要跟着换，否则实测文案会张冠李戴
+            self._ac_brand, self._ac_brand_count = self._ac_resolve_brand(
+                ac_library, self._ac_bin
+            )
+        try:
+            self._ac_code = await self.hass.async_add_executor_job(
+                ac_library.load_device, self._ac_bin
+            )
+        except (OSError, ValueError):
+            return None
+        return True
+
     async def async_step_ac_test_on(self, user_input: dict | None = None):
         """空调实测第一段：发**开机帧**，确认空调有反应。
 
-        ⚠️ 为什么要两段（09-28 用户实测教训）：只发关机帧时，空调**本来就关着**
-        ⇒ 毫无可见反应，用户无从判断发射链路好坏。SmartAC 是开机→关机两段确认，
-        这里对齐。第二段（关机帧）在 async_step_ac_test。
+        ⚠️ 为什么要两段：只发关机帧的话，空调本来就关着 ⇒ 毫无可见反应，
+        用户无从判断发射链路好坏。所以先开机、再关机，两段都确认。
         """
         ac_library = await self._async_ac_library()
 
         if user_input is not None:
             result = user_input[CONF_TEST_RESULT]
             if result == TEST_RETRY:
-                return await self.async_step_ac_device()
+                return await (
+                    self.async_step_learn_pick()
+                    if self._from_learn
+                    else self.async_step_ac_device()
+                )
             if result == TEST_NEXT:
-                nxt = self._ac_index + 1
-                if nxt >= len(self._ac_candidates):
-                    return self.async_abort(reason="test_exhausted")
-                self._ac_index = nxt
-                self._ac_bin = self._ac_candidates[nxt]
-                try:
-                    self._ac_code = await self.hass.async_add_executor_job(
-                        ac_library.load_device, self._ac_bin
-                    )
-                except (OSError, ValueError):
+                moved = await self._ac_advance(ac_library)
+                if moved is None:
                     return self.async_abort(reason="ac_decode_failed")
+                if not moved:
+                    return self.async_abort(reason="test_exhausted")
             elif result == TEST_OK:
                 return await self.async_step_ac_test()
             else:  # skip —— 直接进第二段（关机确认）
@@ -540,7 +631,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             errors=errors or None,
             description_placeholders={
-                "brand": self._ac_brand,
+                "brand": self._ac_brand_label(),
                 "model": model_short,
                 "index": str(self._ac_index + 1),
                 "total": str(max(len(self._ac_candidates), 1)),
@@ -548,28 +639,23 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_ac_test(self, user_input: dict | None = None):
-        """空调实测第二段：发一帧**关机码**，确认后才建 entry。
-
-        第一段（开机帧）见 async_step_ac_test_on —— 两段都确认，对齐 SmartAC。
-        """
+        """空调实测第二段：发一帧**关机码**，确认后才建 entry。"""
         ac_library = await self._async_ac_library()
 
         if user_input is not None:
             result = user_input[CONF_TEST_RESULT]
             if result == TEST_RETRY:
-                return await self.async_step_ac_device()
+                return await (
+                    self.async_step_learn_pick()
+                    if self._from_learn
+                    else self.async_step_ac_device()
+                )
             if result == TEST_NEXT:
-                nxt = self._ac_index + 1
-                if nxt >= len(self._ac_candidates):
-                    return self.async_abort(reason="test_exhausted")
-                self._ac_index = nxt
-                self._ac_bin = self._ac_candidates[nxt]
-                try:
-                    self._ac_code = await self.hass.async_add_executor_job(
-                        ac_library.load_device, self._ac_bin
-                    )
-                except (OSError, ValueError):
+                moved = await self._ac_advance(ac_library)
+                if moved is None:
                     return self.async_abort(reason="ac_decode_failed")
+                if not moved:
+                    return self.async_abort(reason="test_exhausted")
             else:  # ok / skip
                 return self._async_finish_ac(ac_library)
 
@@ -592,22 +678,418 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             errors=errors or None,
             description_placeholders={
-                "brand": self._ac_brand,
+                "brand": self._ac_brand_label(),
                 "model": model_short,
                 "index": str(self._ac_index + 1),
                 "total": str(max(len(self._ac_candidates), 1)),
             },
         )
 
+    def _ac_brand_label(self) -> str:
+        """测两步文案里的"向谁发码"。
+
+        一个 bin 常被多个品牌共用（509 个里 149 个，最多一个有 216 个品牌），
+        配对路径反查出来的只是其中一个 ⇒ 多品牌时说清是共用码。
+        """
+        if self._ac_brand_count > 1:
+            return f"{self._ac_brand_count} 个品牌共用"
+        return self._ac_brand or "未知品牌"
+
+    @staticmethod
+    def _ac_resolve_brand(ac_library: AcLibrary, bin_name: str) -> tuple[str, int]:
+        """配对路径反查品牌：返回 (品牌名, 共用品牌数)。
+
+        ⚠️ 多品牌共用时品牌名返回**空串** —— 真正的未知量是"这台机器是哪个牌子"。
+        拿 `brand_of` 的首个品牌当名字会写出 "Armcor 空调 11272" 这种用户认不出的
+        entry / 设备名（11272 实际被 79 个品牌共用，其中有美的）。空串会让 entry
+        标题与设备名都退化成 "空调 11272"，这才是诚实的。
+        """
+        count = len(ac_library.brands_of(bin_name))
+        return (ac_library.brand_of(bin_name) if count == 1 else ""), count
+
     def _async_finish_ac(self, ac_library: AcLibrary):
         """建空调 entry（建完出 climate 温控面板）。"""
-        title = CodeLibrary.display_name(
-            self._ac_brand,
-            f"空调 {self._ac_bin.removesuffix('.bin').replace('irda_new_ac_', '')}",
-        )
+        model_short = self._ac_bin.removesuffix(".bin").replace("irda_new_ac_", "")
+        # 配对路径下品牌可能是空串（共用码，见 `_ac_resolve_brand`）；
+        # 手动路径品牌是用户自己选的，一定非空。
         return self.async_create_entry(
-            title=title,
+            title=CodeLibrary.display_name(self._ac_brand, f"空调 {model_short}"),
             data=self._entry_data(),
+        )
+
+    # ----------------------------------------------- 学习模式：用遥控器配对
+    #
+    # 流程：learn_setup（发射目标 + 接收器 + 大类）
+    #       → learn_press（按电源键，捕获）
+    #       → learn_press2（可选：再按一个键，用两键交集收敛型号）
+    #       → learn_pick（从候选设备里挑一个）
+    #       → learn_test（发该设备 power 码实测）→ 建 entry
+    #
+    # 匹配引擎见 learn_match.py；效果见 tools/verify_learn_match.py
+    # （默认抽 120 例帧命中 100%、双键真值命中 100%）。
+    #
+    # 空调也走这条路，只是候选与实测步不同：
+    #   ac_bin = learn_match_ac.match_ac() 的候选 → learn_pick 列出**型号**
+    #   → ac_test_on / ac_test（复用「先开机、再关机」两段式实测）
+    #   → 实测"没反应"退回 learn_pick 换型号（`_from_learn` 标志），而不是手动选型号。
+    # 匹配引擎见 learn_match_ac.py；效果见 tools/verify_learn_ac.py
+    # （120 例真型号 top8 命中 100%、两键交集 100%）。
+
+    @callback
+    def _learn_on_signal(self, signal) -> None:
+        """接收回调（同步、必须极快）：把一帧原始时序规整后入缓冲。"""
+        capture = normalize_capture(getattr(signal, "timings", None))
+        if capture is not None:
+            self._learn_captures.append((capture, getattr(signal, "modulation", None)))
+
+    def _learn_start_capture(self) -> None:
+        """清空缓冲并订阅所选接收器。"""
+        self._learn_captures = []
+        self._learn_stop_capture()
+        try:
+            self._learn_unsub = infrared.async_subscribe_receiver(
+                self.hass, self._receiver, self._learn_on_signal
+            )
+        except Exception:  # noqa: BLE001 —— 接收器消失/实体名失效都要落到表单
+            _LOGGER.exception("IR Hub learn: 订阅红外接收器失败：%s", self._receiver)
+            self._learn_unsub = None
+
+    def _learn_stop_capture(self) -> None:
+        """取消接收订阅（幂等）。"""
+        if self._learn_unsub is not None:
+            try:
+                self._learn_unsub()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("IR Hub learn: 取消接收订阅时出错（忽略）")
+            self._learn_unsub = None
+
+    def _learn_best_capture(self) -> tuple[list[int], int | None] | None:
+        """一次按压常被接收器拆成多帧（重复帧），取元素最多的那帧最干净。"""
+        if not self._learn_captures:
+            return None
+        return max(self._learn_captures, key=lambda item: len(item[0]))
+
+    async def async_step_learn_setup(self, user_input: dict | None = None):
+        """学习模式第 1 步：发射目标 + 红外接收器 + 设备大类（含空调）。"""
+        library = await self._async_library()
+        await self._async_ac_library()
+
+        if not _HAS_RECEIVER_API:
+            return self.async_abort(reason="receiver_api_missing")
+        receivers = infrared.async_get_receivers(self.hass)
+        if not receivers:
+            return self.async_abort(reason="no_receivers")
+
+        if user_input is not None:
+            self._tx_target = str(user_input[CONF_TX_TARGET]).strip()
+            error = await async_validate_target(
+                self.hass, self._tx_type, self._tx_target
+            )
+            if error is not None:
+                return self.async_show_form(
+                    step_id="learn_setup",
+                    data_schema=self._learn_setup_schema(receivers),
+                    errors={"base": error},
+                    description_placeholders=self._learn_setup_placeholders(library),
+                )
+            self._receiver = user_input[CONF_RECEIVER]
+            picked = str(user_input[CONF_CATEGORY])
+            # 空调是特殊项（"ac"），其余大类是数字 id
+            self._category = CATEGORY_AC if picked == CATEGORY_AC else int(picked)
+            return await self.async_step_learn_press()
+
+        return self.async_show_form(
+            step_id="learn_setup",
+            data_schema=self._learn_setup_schema(receivers),
+            description_placeholders=self._learn_setup_placeholders(library),
+        )
+
+    def _learn_setup_schema(self, receivers: list[str]) -> vol.Schema:
+        """学习模式第 1 步的表单（大类含空调）。"""
+        return vol.Schema(
+            {
+                vol.Required(CONF_TX_TARGET): self._tx_target_validator(),
+                vol.Required(CONF_RECEIVER): vol.In({rid: rid for rid in receivers}),
+                vol.Required(CONF_CATEGORY): vol.In(self._category_options()),
+            }
+        )
+
+    def _learn_setup_placeholders(self, library: CodeLibrary) -> dict[str, str]:
+        return {
+            "tx_type": dict(TX_TYPE_OPTIONS).get(self._tx_type, self._tx_type),
+            "tx_target_hint": _TX_TARGET_LABELS.get(self._tx_type, ""),
+            "generated": library.generated or "未知",
+        }
+
+    async def async_step_learn_press(self, user_input: dict | None = None):
+        """学习模式第 2 步：捕获**电源键**。"""
+        if user_input is not None:
+            best = self._learn_best_capture()
+            if best is None:
+                # 订阅保持有效，用户可直接再按一次后重新提交
+                return self.async_show_form(
+                    step_id="learn_press",
+                    data_schema=vol.Schema({}),
+                    errors={"base": "no_signal"},
+                    description_placeholders=self._learn_press_placeholders("电源键", 1),
+                )
+            self._learn_stop_capture()
+            self._learn_capture1 = best[0]
+            return await self.async_step_learn_press2()
+
+        self._learn_start_capture()
+        return self.async_show_form(
+            step_id="learn_press",
+            data_schema=vol.Schema({}),
+            description_placeholders=self._learn_press_placeholders("电源键", 1),
+        )
+
+    async def async_step_learn_press2(self, user_input: dict | None = None):
+        """学习模式第 3 步（可选）：再按一个键，用两键交集收敛型号。"""
+        key_hint = (
+            "温度+（或风速键）"
+            if self._category == CATEGORY_AC
+            else "音量+（或方向键 / 频道+）"
+        )
+
+        if user_input is not None:
+            if user_input[CONF_LEARN_ACTION] == LEARN_ACTION_SKIP:
+                self._learn_stop_capture()
+                self._learn_capture2 = None
+                return await self.async_step_learn_pick()
+            best = self._learn_best_capture()
+            if best is None:
+                return self.async_show_form(
+                    step_id="learn_press2",
+                    data_schema=self._learn_action_schema(),
+                    errors={"base": "no_signal"},
+                    description_placeholders=self._learn_press_placeholders(key_hint, 2),
+                )
+            self._learn_stop_capture()
+            self._learn_capture2 = best[0]
+            return await self.async_step_learn_pick()
+
+        self._learn_start_capture()
+        return self.async_show_form(
+            step_id="learn_press2",
+            data_schema=self._learn_action_schema(),
+            description_placeholders=self._learn_press_placeholders(key_hint, 2),
+        )
+
+    def _learn_action_schema(self) -> vol.Schema:
+        return vol.Schema(
+            {
+                vol.Required(CONF_LEARN_ACTION, default=LEARN_ACTION_NEXT): vol.In(
+                    LEARN_ACTION_OPTIONS
+                )
+            }
+        )
+
+    def _learn_press_placeholders(self, key_hint: str, seq: int) -> dict[str, str]:
+        return {
+            "key_hint": key_hint,
+            "seq": str(seq),
+            "receiver": self._receiver,
+            "category": self._category_label(),
+            "captured": str(len(self._learn_captures)),
+        }
+
+    def _learn_converge(self, scores1: dict, scores2: dict | None, what: str) -> list:
+        """有第二键就取交集，否则（或交集为空）退回单键排序。"""
+        if scores2:
+            common = set(scores1) & set(scores2)
+            if common:
+                self._learn_used_two_keys = True
+                ranked = sorted(
+                    common, key=lambda key: -min(scores1[key], scores2[key])
+                )
+                return ranked[:_LEARN_MAX_CANDIDATES]
+            # 交集为空（第二键没对上/按错了）→ 退回单键结果，别把用户卡死
+            _LOGGER.warning("IR Hub learn: 第二键与第一键无交集（%s），退回单键候选", what)
+        ranked = sorted(scores1, key=lambda key: -scores1[key])
+        return ranked[:_LEARN_MAX_CANDIDATES]
+
+    async def _async_learn_match(self, library: CodeLibrary) -> list:
+        """跑匹配引擎（executor 里，别阻塞事件循环），返回候选列表。
+
+        按键类设备的候选是 device_id（int）；空调是 bin 文件名（str）。
+        """
+        capture1 = self._learn_capture1 or []
+
+        if self._category == CATEGORY_AC:
+            return await self._async_learn_match_ac(capture1)
+
+        def _device_scores(frames: list[dict]) -> dict[int, float]:
+            scores: dict[int, float] = {}
+            for frame in frames:
+                for device_id in frame["device_ids"]:
+                    scores[device_id] = max(scores.get(device_id, 0.0), frame["score"])
+            return scores
+
+        frames1 = await self.hass.async_add_executor_job(
+            match_timings, library, self._category, capture1, _LEARN_TOP_N
+        )
+        self._learn_top_score = frames1[0]["score"] if frames1 else 0.0
+        scores1 = _device_scores(frames1)
+
+        scores2 = None
+        capture2 = self._learn_capture2
+        if capture2:
+            frames2 = await self.hass.async_add_executor_job(
+                match_timings, library, self._category, capture2, _LEARN_TOP_N
+            )
+            scores2 = _device_scores(frames2)
+        return self._learn_converge(scores1, scores2, "按键类")
+
+    async def _async_learn_match_ac(self, capture1: list[int]) -> list[str]:
+        """空调：对状态码库跑匹配（候选是 bin 名），两键取交集收敛型号。"""
+        ac_library = await self._async_ac_library()
+
+        def _bin_scores(hits: list[dict]) -> dict[str, float]:
+            return {hit["bin"]: hit["score"] for hit in hits}
+
+        # 候选是"型号"不是"帧"，结构预筛后本来就只剩几十个；且实测真值只有 85.8%
+        # 排第 1、100% 落在前 8 ⇒ 不能像按键类那样只取 top_n=8，全给出去（最后还是
+        # 由 _learn_converge 截到 _LEARN_MAX_CANDIDATES）。
+        hits1 = await self.hass.async_add_executor_job(
+            match_ac, ac_library, capture1, None
+        )
+        self._learn_top_score = hits1[0]["score"] if hits1 else 0.0
+        scores1 = _bin_scores(hits1)
+
+        scores2 = None
+        capture2 = self._learn_capture2
+        if capture2:
+            hits2 = await self.hass.async_add_executor_job(
+                match_ac, ac_library, capture2, None
+            )
+            scores2 = _bin_scores(hits2)
+        return self._learn_converge(scores1, scores2, "空调")
+
+    async def _async_pick_ac(self, bin_name: str):
+        """空调：锁定型号（解码一次）后，进既有的「开机 → 关机」两段式实测。"""
+        ac_library = await self._async_ac_library()
+        try:
+            self._ac_code = await self.hass.async_add_executor_job(
+                ac_library.load_device, bin_name
+            )
+        except (OSError, ValueError):
+            return self.async_abort(reason="ac_decode_failed")
+        self._from_learn = True
+        self._ac_bin = bin_name
+        self._ac_brand, self._ac_brand_count = self._ac_resolve_brand(ac_library, bin_name)
+        # 「自动试下一个」在配对路径下 = 下一个**匹配候选**（按相似度），
+        # 而不是同品牌型号 —— 用户是在候选列表里挑的，退回去也得在同一个列表里退。
+        self._ac_candidates = list(self._learn_candidates or [bin_name])
+        self._ac_index = (
+            self._ac_candidates.index(bin_name)
+            if bin_name in self._ac_candidates
+            else 0
+        )
+        return await self.async_step_ac_test_on()
+
+    async def _learn_pick_options(self, library: CodeLibrary) -> dict[str, str]:
+        """候选下拉：key 是提交值（device_id 或空调 bin），value 是显示名。"""
+        options: dict[str, str] = {}
+        if self._category == CATEGORY_AC:
+            ac_library = await self._async_ac_library()
+            for bin_name in self._learn_candidates or []:
+                brands = ac_library.brands_of(bin_name)
+                model_short = bin_name.removesuffix(".bin").replace("irda_new_ac_", "")
+                if len(brands) == 1:
+                    label = CodeLibrary.display_name(brands[0], f"空调 {model_short}")
+                else:
+                    # 共用码：不挑一个品牌来冒充（509 个 bin 里 149 个是多品牌共用的）
+                    label = f"空调 {model_short}（{len(brands)} 个品牌共用）"
+                options[bin_name] = label
+            return options
+
+        for device_id in self._learn_candidates or []:
+            device = library.get_device(device_id)
+            if device is None:
+                continue
+            options[str(device_id)] = library.display_name(
+                library.brands.get(device["brand"]) or f"品牌 {device['brand']}",
+                device["name"],
+            )
+        return options
+
+    async def async_step_learn_pick(self, user_input: dict | None = None):
+        """学习模式第 4 步：从匹配到的候选里挑一个型号。"""
+        library = await self._async_library()
+
+        if self._learn_candidates is None:
+            self._learn_candidates = await self._async_learn_match(library)
+
+        if user_input is not None:
+            picked = str(user_input[CONF_DEVICE])
+            if self._category == CATEGORY_AC:
+                return await self._async_pick_ac(picked)
+            device_id = int(picked)
+            device = library.get_device(device_id)
+            if device is None:
+                return self.async_abort(reason="device_gone")
+            self._device_id = device_id
+            self._brand = int(device.get("brand") or 0)
+            return await self.async_step_learn_test()
+
+        options = await self._learn_pick_options(library)
+        if not options:
+            return self.async_abort(reason="learn_no_match")
+
+        return self.async_show_form(
+            step_id="learn_pick",
+            data_schema=vol.Schema({vol.Required(CONF_DEVICE): vol.In(options)}),
+            description_placeholders={
+                "count": str(len(options)),
+                "category": self._category_label(),
+                "keys": "两键交集" if self._learn_used_two_keys else "仅电源键",
+                "score": f"{self._learn_top_score:.2f}",
+            },
+        )
+
+    async def async_step_learn_test(self, user_input: dict | None = None):
+        """学习模式第 5 步：发该型号的 power 实测码，确认后建 entry。"""
+        library = await self._async_library()
+
+        if user_input is not None:
+            result = user_input[CONF_TEST_RESULT]
+            if result == TEST_RETRY:
+                return await self.async_step_learn_pick()
+            device = library.get_device(self._device_id)
+            if device is None:
+                return self.async_abort(reason="device_gone")
+            return self._async_finish_device(library, device)
+
+        device = library.get_device(self._device_id)
+        if device is None:
+            return self.async_abort(reason="device_gone")
+
+        errors: dict[str, str] = {}
+        keys = library.key_names(device)
+        key = keys[0] if keys else None
+        timings = library.get_timings(self._device_id, key) if key else None
+        if timings is None:
+            errors["base"] = "no_test_key"
+        else:
+            try:
+                await self._async_send_test(timings)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "IR Hub learn: 测试码发送失败（%s/%s）", self._tx_type, self._tx_target
+                )
+                errors["base"] = "send_failed"
+
+        return self.async_show_form(
+            step_id="learn_test",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_TEST_RESULT): vol.In(LEARN_TEST_OPTIONS)}
+            ),
+            errors=errors or None,
+            description_placeholders={
+                "model": device["name"],
+                "key": key or "—",
+            },
         )
 
     # ------------------------------------------------------------- 选项

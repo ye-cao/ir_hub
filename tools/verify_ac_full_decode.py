@@ -1,4 +1,8 @@
-# 全量解码验收：index.json 引用的每个 bin 都真实展开（decode_bin）
+"""全量解码验收：index.json 引用的每个 bin 都真实展开一次（decode_bin）。
+
+顺便打印美的 / 格力 / TCL 的型号数作为抽样锚点。
+跑法：<venv>/python tools/verify_ac_full_decode.py
+"""
 import json
 import os
 import sys

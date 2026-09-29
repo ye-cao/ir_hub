@@ -1,15 +1,15 @@
 """climate 平台 —— AC 码库设备 = 一个真正的空调温控面板。
 
-用户视角：添加集成时选「空调 · 温控面板」→ 品牌 → 型号，
-得到一个标准 `climate.*` 实体 —— 温度滑条 / 模式 / 风速全原生可调，
-dashboard 上直接用恒温器卡片，**不需要** SmartIR/SmartAC。
+用户视角：添加集成时选「空调 · 温控面板」→ 品牌 → 型号，得到一个标准
+`climate.*` 实体，温度滑条 / 模式 / 风速全原生可调，dashboard 上直接用恒温器
+卡片，不需要 SmartIR / SmartAC。
 
-实现要点（与 remote/button 平台同构的部分不赘述）：
+实现要点：
   · `InfraredEmitterConsumerEntity` 提供 `_send_command()` 与 emitter 可用性跟随。
   · 每次状态变更 = 从 AC 码库查 `[模式][风速][温度]` 的一帧带符号时序发出。
     空调是"全状态帧"协议：改温度就重发整帧，不是"温度+/-"增量键。
-  · `RestoreEntity`：重启后恢复模式/风速/温度（物理遥控器改的状态我们
-    看不到 —— 红外单向，这点与 SmartAC 一致，功率传感器联动留待后续）。
+  · `RestoreEntity`：重启后恢复模式/风速/温度。物理遥控器改的状态看不到
+    （红外单向，与 SmartAC 一致）。
   · off 有专用帧（`commands["off"]`）；开机/调温/调风共用"状态帧"。
 """
 
@@ -67,7 +67,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the climate platform (AC entries only)."""
+    """只处理空调条目：解码 AC 码库后建 climate 实体。"""
     data = {**entry.data, **entry.options}
     if data.get(CONF_CATEGORY) != CATEGORY_AC:
         return
@@ -83,11 +83,7 @@ async def async_setup_entry(
 
 
 class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
-    """One AC model from the irext state-code library, as a climate entity.
-
-    MRO：IrHubClimate → InfraredEmitterConsumerEntity → InfraredConsumerEntity
-         → ClimateEntity → RestoreEntity → ToggleEntity → Entity
-    """
+    """AC 码库里的一个型号，映射成 climate 实体。"""
 
     _attr_has_entity_name = True
     _attr_should_poll = False
@@ -111,7 +107,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         model_short = model.removesuffix(".bin").replace("irda_new_ac_", "")
 
         self._code = code
-        # 发射通道（旧条目只有 CONF_EMITTER ⇒ 兼容回退为 infrared）
+        # 发射通道（旧条目只有 CONF_EMITTER ⇒ 回退为 infrared）
         self._tx_type: str = data.get(CONF_TX_TYPE) or TX_INFRARED
         self._tx_target: str = (
             data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
@@ -167,7 +163,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ 恢复
 
     async def async_added_to_hass(self) -> None:
-        """infrared 通道先跟随 emitter 可用性，然后恢复状态。
+        """infrared 通道先跟随 emitter 可用性，然后恢复上次状态。
 
         ⚠️ RestoreEntity 的恢复走 `async_get_last_state()` 直接调用（不经过
         super() 链）⇒ 非 infrared 通道跳过 super() 不会跳过恢复。
@@ -221,7 +217,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ 发射通道
 
     async def _send_command(self, command) -> None:
-        """按通道路由：infrared 走 consumer 基类；其余由 transmitter 打包发服务。"""
+        """按通道路由：infrared 走 consumer 基类；其余交给 transmitter 打包发服务。"""
         if self._tx_type == TX_INFRARED:
             await super()._send_command(command)
             return
@@ -238,6 +234,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ 设置
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """切模式；关机的帧由 _send_state_frame 按 OFF 分支处理。"""
         self._attr_hvac_mode = hvac_mode
         if hvac_mode != HVACMode.OFF:
             self._last_on_operation = hvac_mode
@@ -245,6 +242,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        """改温度（超出码库范围就忽略 + 警告）。"""
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
@@ -262,13 +260,14 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
+        """改风速。"""
         self._attr_fan_mode = fan_mode
         if self._attr_hvac_mode != HVACMode.OFF:
             await self._send_state_frame()
         self.async_write_ha_state()
 
     async def async_turn_on(self) -> None:
-        """开机 = 回到上次开的模式；没记录就制冷 26°C（行业惯例）。"""
+        """开机 = 回到上次开的模式；没记录就制冷（行业惯例）。"""
         if self._last_on_operation is not None:
             await self.async_set_hvac_mode(self._last_on_operation)
         else:
@@ -279,6 +278,7 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
             await self.async_set_hvac_mode(fallback)
 
     async def async_turn_off(self) -> None:
+        """关机。"""
         await self.async_set_hvac_mode(HVACMode.OFF)
 
     # ------------------------------------------------------------------ 发送
@@ -292,8 +292,8 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
             temps = fans.get(self._attr_fan_mode) or {}
             timings = temps.get(str(int(self._attr_target_temperature)))
             if timings is None:
-                # 该模式×风速×温度组合在这台空调的码库里不存在
-                # （如制热无低风）—— 报清楚，别静默发错帧
+                # 该 模式×风速×温度 组合在这台空调的码库里不存在（如制热无低风）
+                # —— 报清楚，别静默发错帧。
                 raise HomeAssistantError(
                     f"IR Hub: {self._attr_device_info['name']} 不支持组合 "
                     f"模式={self._attr_hvac_mode.value} / 风速={self._attr_fan_mode} / "

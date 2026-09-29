@@ -1,17 +1,12 @@
-"""裸时序红外命令，以及构造/解析辅助。
+"""裸时序红外命令的构造与解析。
 
-HA 的红外体系用 `infrared_protocols.commands.Command` 作为"要发什么"的统一载体。
-基类是个纯抽象类：
+HA 用 `infrared_protocols.commands.Command` 表示"要发什么"。它是个抽象基类，
+只有 modulation / repeat_count 两个字段和一个 `get_raw_timings()`。
+本模块提供一个直接把现成时序数组塞进去的子类，这样码库里的任意波形都能交给
+任何 emitter，不必等官方支持该协议。
 
-    class Command(abc.ABC):
-        repeat_count: int
-        modulation: int
-        def __init__(self, *, modulation: int, repeat_count: int = 0) -> None: ...
-        @abc.abstractmethod
-        def get_raw_timings(self) -> list[int]: ...
-
-所以我们只要实现一个"把现成时序数组塞进去"的子类，就能把 irext 码库里的
-**任意**波形交给任何 emitter（不用等官方库支持该协议）。
+时序约定（与 ESPHome `remote_transmitter.transmit_raw` 一致，无需换算）：
+    正数 = pulse（载波开），负数 = space（载波空闲），单位 µs。
 """
 
 from __future__ import annotations
@@ -28,12 +23,7 @@ __all__ = ["RawTimingsCommand", "build_raw_command", "parse_timings"]
 
 
 class RawTimingsCommand(Command):
-    """A command defined by an explicit list of raw timings.
-
-    Timings are in microseconds; positive = pulse (carrier on),
-    negative = space (carrier off). This is the same convention ESPHome's
-    `remote_transmitter.transmit_raw` uses, so no conversion is needed.
-    """
+    """由显式时序数组定义的命令（正 = pulse，负 = space，单位 µs）。"""
 
     def __init__(
         self,
@@ -52,7 +42,7 @@ class RawTimingsCommand(Command):
         self._timings = list(timings)
 
     def get_raw_timings(self) -> list[int]:
-        """Return the raw timings (µs, positive = pulse, negative = space)."""
+        """返回裸时序（µs，正 = pulse，负 = space）。"""
         return self._timings
 
     def __repr__(self) -> str:
@@ -76,20 +66,13 @@ def build_raw_command(
 ) -> RawTimingsCommand:
     """构造要交给 emitter 的裸时序命令。
 
-    ⚠️ `Command.repeat_count` 在本链路上是**装饰性**的，别指望它生效：
-        HA 的 esphome emitter（`components/esphome/infrared.py` →
-        `EsphomeInfraredEmitterEntity.async_send_command`）只透传
+    ⚠️ `Command.repeat_count` 在本链路上只是装饰：HA 的 esphome emitter 只把
+    `timings` 和 `modulation` 透传给设备，repeat_count 走 protobuf 默认值 1，
+    ESPHome 侧最终 `set_send_times(1)` ⇒ 只发一遍。
 
-            timings = command.get_raw_timings()
-            carrier_frequency = command.modulation
-
-        两个值给 aioesphomeapi 的 `infrared_rf_transmit_raw_timings()`，而该函数
-        的 `repeat_count` 参数**没有被传**，于是走 protobuf 默认值 1；
-        ESPHome 侧 `IrRfProxy` 最终 `set_send_times(1)` ⇒ 只发一遍。
-
-    所以"多送几次"必须在**时序层面复制**，这里替调用方做掉：
-    repeats=1 视为只发一次（不复制），repeats=3 则把整帧拼三遍。
-    irext 存的帧是 mark 开头、space 结尾，首尾相接仍是合法的 mark/space 交替。
+    所以"多送几次"必须在时序层面复制，这里替调用方做掉：
+    repeats=1 不复制，repeats=3 就把整帧拼三遍。
+    irext 的帧是 mark 开头、space 结尾，首尾相接仍是合法的 mark/space 交替。
     """
     repeats = int(repeats or 1)
     if repeats < 1:

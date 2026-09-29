@@ -1,34 +1,27 @@
 """发射通道抽象 —— 一个码库，四种发射器。
 
-对齐 SmartAC 的 controller 抽象（re/smartac/controller.py，MIT），让没有
-自制 ESPHome 硬件的用户也能用现成发射器：
+对齐 SmartAC 的 controller 抽象（re/smartac/controller.py，MIT），让没有自制
+ESPHome 硬件的用户也能用现成发射器：
 
-=================  ============================  ==============================
-通道               目标（CONF_TX_TARGET）         发送方式
-=================  ============================  ==============================
-infrared（默认）   infrared emitter 实体          `infrared.async_send_command`
-esphome            esphome 动作名（可带前缀）      `esphome.<动作>` 服务，
-                                                  data {"command": [带符号时序]}
-                                                  —— 与 SmartAC 契约逐字段一致
-broadlink          remote.<实体>                  µs→tick(÷30.45) → 0x26 包 →
-                                                  b64 → `remote.send_command`
-                                                  （与 SmartAC raw2broadlink
-                                                  逐字节一致，selfcheck 有对拍）
-mqtt               topic                          `mqtt.publish`，载荷 smartac 裸数组
-                                                  （默认）或 Tasmota RAW JSON
-=================  ============================  ==============================
+    通道              目标                    发送方式
+    infrared（默认）  infrared emitter 实体   infrared.async_send_command
+    esphome           esphome 动作名（可带     esphome.<动作> 服务，
+                      前缀）                   data {"command": [带符号时序]}
+    broadlink         remote.<实体>           µs→tick → 0x26 包 → b64 →
+                                             remote.send_command
+    mqtt              topic                    mqtt.publish，载荷见 mqtt_format
 
-⚠️ 三个从 SmartAC 源码核实的细节：
-  1. SmartAC 交给 controller 的是**全正** µs 数组，符号在 ESPHomeController
-     里补（偶正奇负）。我们的码库出口**已带符号** ⇒ 传给 esphome 通道直接用；
-     传给 broadlink/mqtt 通道取绝对值（它们只认交替的正值序列）。
-  2. Broadlink tick = µs × 269 / 8192（≈ 30.45 µs/tick，**不是** 32.84），
-     `0x00` 是转义符（后跟 2 字节 big-endian），包尾 `0x0d 0x05`，整包补零到
-     16 字节倍数（AES 块）。
-  3. MQTT 有两种载荷（`mqtt_format`）：**smartac**（默认）= 裸全正 µs 数组
-     `json.dumps([4450,4450,560,...])` —— tcl-ir 等桥接固件解析的就是它（09-28
-     实测：发 Tasmota JSON 设备无反应）；**tasmota** = IRMQTTServer RAW JSON
-     （`Raw` 是逗号分隔的全正 µs 序列，首个值 = mark），刷 Tasmota 固件即用。
+符号约定：本集成的码库出口**已带符号**（正 = mark，负 = space）。
+  · esphome 通道直接用（SmartAC 契约就是带符号数组）；
+  · broadlink / mqtt 通道取绝对值（它们只认交替的正值序列）。
+
+两个从 SmartAC 源码核实的细节：
+  1. Broadlink tick = µs × 269 / 8192（≈ 30.45 µs/tick，不是 32.84）；
+     `0x00` 是转义符（后跟 2 字节 big-endian），包尾 `0x0d 0x05`，
+     整包补零到 16 字节倍数（AES 块）。
+  2. MQTT 有两种载荷：**smartac**（默认）= 裸全正 µs 数组，tcl-ir 等桥接固件
+     解析的就是它（发 Tasmota JSON 格式设备无反应）；**tasmota** = IRMQTTServer
+     的 RAW JSON。刷 Tasmota 固件的用户用后者。
 """
 
 from __future__ import annotations
@@ -98,13 +91,11 @@ async def async_send_timings(
     delay: float = DEFAULT_TX_DELAY,
     mqtt_format: str = DEFAULT_MQTT_FORMAT,
 ) -> None:
-    """把**带符号**时序（正=mark/负=space，µs）经指定通道发出去。
+    """把**带符号**时序（正 = mark / 负 = space，µs）经指定通道发出去。
 
-    repeats 的"时序层面复制"由调用方（build_raw_command 或手工拼接）完成
-    —— 本函数拿到什么就发什么，不重复。
+    本函数不发重复帧 —— "多送几次"由调用方在时序层面复制好再传进来。
     """
     if tx_type == TX_INFRARED:
-        # 红外 building block 通道（见 ir_command.build_raw_command 的调用方）
         from homeassistant.components import infrared
 
         from .ir_command import RawTimingsCommand
@@ -114,7 +105,7 @@ async def async_send_timings(
         return
 
     if tx_type == TX_ESPHOME:
-        # SmartAC 契约：偶正奇负的带符号数组，直接交服务
+        # SmartAC 契约：带符号数组，直接交服务
         service = tx_target.split(".", 1)[-1] if "." in tx_target else tx_target
         await hass.services.async_call(
             "esphome", service, {"command": list(timings)}, blocking=True
@@ -144,7 +135,7 @@ async def async_send_timings(
                 {"Protocol": "RAW", "Bits": 0, "Raw": raw, "Frequency": int(carrier)}
             )
         else:
-            # SmartAC 契约：裸全正 µs 数组（tcl-ir 等桥接固件解析的就是它）
+            # SmartAC 契约：裸全正 µs 数组
             payload = json.dumps([abs(t) for t in timings])
         await hass.services.async_call(
             "mqtt", "publish", {"topic": tx_target, "payload": payload}, blocking=True
@@ -161,7 +152,7 @@ async def async_validate_target(
 ) -> str | None:
     """校验发射目标当前是否可用；返回错误 key（None = 通过）。
 
-    只在 config flow 里用 —— 能拦住"手滑填错"就够了，不做运行时强校验。
+    只在 config flow 里用 —— 拦住"手滑填错"就够了，不做运行时强校验。
     """
     if tx_type == TX_INFRARED:
         from homeassistant.components import infrared

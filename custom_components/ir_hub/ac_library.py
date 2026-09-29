@@ -2,27 +2,20 @@
 
 与 `library.py`（按键式设备：一个键 = 一帧定长时序）不同，空调是**状态机**：
 同一台空调的"制冷 26°C / 高风"和"制热 20°C / 低风"是完全不同的两帧。
-irext 为此把每台空调的编码规则压成一个几百字节的 `.bin`（TAG 表 + 位定义 +
-校验算法），运行时按目标状态**生成**时序 —— 这就是本模块做的事。
+irext 把每台空调的编码规则压成一个几百字节的 `.bin`（TAG 表 + 位定义 + 校验
+算法），运行时按目标状态**生成**时序 —— 这就是本模块做的事。
 
-来源与授权：
-    解码器是 irext（https://site.irext.net，MIT License）官方
-    `ir_decode.c`（AC 分支）的 Python 移植，参考实现取自
-    ryanh7/SmartAC（HACS 集成，同源 MIT）。
-    `ac_library/codes/*.bin` 与 `index.json` 同样来自 irext 数据库导出。
-    本文件按本项目风格整理，逐行为与 SmartAC 的实现保持**可对照**。
+为什么用 bin 而不是展开成时序表：525 个 bin 共 ~171 KB，展开成时序后
+每型号 5 模式 × 4 风速 × 15 温度 ≈ 300 帧 × 200 值，全库要几百 MB，没法打包。
 
-为什么用 bin 而不是展开成时序表：
-    525 个 bin 共 ~171 KB，覆盖 245 品牌 / 1507 型号（美的/格力/TCL/海尔全在；
-    0.3.5 起与官网 remote_index 全量对齐——美的 18→26 等 148 个官方新增 bin 已补，
-    官方 zip 里 22 个损坏 bin 已剔除）。
-    展开成时序的话，每型号 5 模式 × 4 风速 × 15 温度 ≈ 300 帧 × 200 值，
-    全库要几百 MB —— 不可打包。
+来源与授权：解码器是 irext（https://site.irext.net，MIT）官方 `ir_decode.c`
+（AC 分支）的 Python 移植，参考实现取自 ryanh7/SmartAC（HACS 集成，同源 MIT）；
+`ac_library/codes/*.bin` 与 `index.json` 同样来自 irext 数据库导出。
+本文件按本项目风格整理，逐行与 SmartAC 保持**可对照**。
 
-⚠️ 符号约定（与 library.py 一致）：
-    irext 解码出的是**全正**的 mark/space 交替长度（不含符号）；
-    ESPHome / HA 要求"正 = mark、负 = space"。所以在 `decode_bin()`
-    出口处就补好符号（复用 `library.sign_timings`），调用方拿到即可发送。
+⚠️ 符号约定（与 library.py 一致）：irext 解码出的是**全正**的 mark/space 长度，
+而 ESPHome / HA 要求"正 = mark、负 = space"。所以 `decode_bin()` 出口处就补好
+符号（复用 `library.sign_timings`），调用方拿到即可发送。
 """
 
 from __future__ import annotations
@@ -38,7 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 AC_LIBRARY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ac_library")
 
 # ---------------------------------------------------------------- irext TAG
-# .bin 文件布局：[tag_count][tag_count × 2B 小端 offset][各 tag 的数据段]
+# .bin 布局：[tag_count][tag_count × 2B 小端 offset][各 tag 的数据段]
 # 详见 irext 官方 ir_decode.c。这里只列 AC 分支用到的 tag。
 TAG_AC_BOOT_CODE = 1
 TAG_AC_ZERO = 2
@@ -150,9 +143,8 @@ def _parse_segments(data: bytes) -> list[bytes]:
 def _seg(segments: list[bytes], index: int) -> bytes:
     """取第 index 段；越界视为空段（= 该模式/风速/温度不被支持）。
 
-    ⚠️ 有些 bin 的段数不足枚举数（数据变异）。SmartAC 对这类 bin 会在
-    setup 时静默失败并跳过整台设备；这里改成**缺段 = 不支持该项**，
-    其余模式照常可用 —— 比 SmartAC 少丢一台是一台。
+    ⚠️ 有些 bin 的段数不足枚举数（数据变异）。SmartAC 对这类 bin 会在 setup 时
+    静默失败并跳过整台设备；这里改成**缺段 = 不支持该项**，其余模式照常可用。
     """
     return segments[index] if 0 <= index < len(segments) else b""
 
@@ -291,6 +283,7 @@ class _AcBin:
     # ------------------------------------------------------------- 状态枚举
 
     def supported_modes(self) -> list[int]:
+        """该型号真正可用的模式（irext 枚举值）。"""
         supported = []
         for mode in _MODES:
             if self._n_mode[mode].get("disabled"):
@@ -305,6 +298,7 @@ class _AcBin:
         return supported
 
     def temperature_range(self, mode: int) -> list[int]:
+        """该模式支持的温度（16~30°C）。"""
         temps = []
         for t in range(0, 15):
             banned = self._n_mode[mode].get("temperature") or []
@@ -318,6 +312,7 @@ class _AcBin:
         return temps
 
     def supported_speeds(self, mode: int) -> list[int]:
+        """该模式支持的风速（irext 枚举值）。"""
         speeds = []
         for s in _SPEEDS:
             banned = self._n_mode[mode].get("speed") or []
@@ -418,6 +413,7 @@ class _AcBin:
     # ------------------------------------------------------------- 位/校验
 
     def _apply_checksum(self, ir_hex: bytearray, checksum: dict) -> bytearray:
+        """按 bin 里声明的算法写入校验字节（支持 8 种类型）。"""
         ctype = checksum["type"]
         value = 0
         if ctype in (CHECKSUM_TYPE_BYTE, CHECKSUM_TYPE_BYTE_INVERSE):
@@ -534,6 +530,7 @@ class _AcBin:
         return ir_hex
 
     def _bits_per_byte(self, index: int) -> int:
+        """该字节实际写几位（默认 8）。"""
         if not self._bit_num:
             return 8
         for bit_num in self._bit_num:
@@ -547,10 +544,12 @@ class _AcBin:
 
     @staticmethod
     def _parse_data(hex_data: str) -> list[bytes]:
+        """hex 字符串 -> 分段列表。"""
         return _parse_segments(bytes.fromhex(hex_data)) if hex_data else []
 
     @staticmethod
     def _parse_n_mode(data: str) -> dict:
+        """解析某模式的禁用项声明。"""
         if data == "NA":
             return {"disabled": True}
         result: dict = {}
@@ -672,6 +671,31 @@ def decode_bin(data: bytes) -> dict:
     }
 
 
+def iter_frames(data: bytes):
+    """逐帧产出 `(state, timings)` —— 供学习匹配**流式**比对。
+
+    state 形如 `("on", 模式, 风速, 温度)` 或 `("off",)`；timings 带符号
+    （与 `decode_bin` 出口一致）。顺序与 `decode_bin` 生成 commands 的顺序相同，
+    最后是关机帧。
+
+    为什么单独提供：一台空调最多 300 帧，`decode_bin` 会把它们全建出来；
+    而学习匹配只要求"一次一帧地过一遍" —— 用生成器就不必把全库 15 万帧塞进内存。
+    """
+    ac = _AcBin(data)
+    modes = ac.supported_modes()
+    if not modes:
+        raise ValueError("该 bin 没有任何可用模式（数据无效？）")
+    for mode in modes:
+        mode_key = HVAC_MODE_MAP[mode]
+        for speed in ac.supported_speeds(mode) or [SPEED_AUTO]:
+            fan_key = SPEED_MAP[speed]
+            for temp in ac.temperature_range(mode) or [26]:
+                yield ("on", mode_key, fan_key, temp), sign_timings(
+                    ac.ir_decode(POWER_ON, temp, mode, speed)
+                )
+    yield ("off",), sign_timings(ac.ir_decode(POWER_OFF, 26, MODE_AUTO, SPEED_AUTO))
+
+
 class AcLibrary:
     """`ac_library/` 下 bin 码库的只读视图。"""
 
@@ -687,21 +711,74 @@ class AcLibrary:
 
     @property
     def brands(self) -> list[str]:
+        """全部品牌名。"""
         return list(self._brands)
 
     @property
     def brand_count(self) -> int:
+        """品牌总数。"""
         return len(self._brands)
 
     @property
     def device_count(self) -> int:
+        """型号总数。"""
         return sum(len(devs) for devs in self._brands.values())
 
     def devices_in(self, brand: str) -> list[dict]:
+        """某品牌下的全部型号条目。"""
         return self._brands.get(brand, [])
 
+    # ------------------------------------------------------------ 反查（学习用）
+
+    @property
+    def index_path(self) -> str:
+        """index.json 所在目录（做缓存键用）。"""
+        return self._path
+
+    def bin_names(self) -> list[str]:
+        """索引引用到的全部 bin（去重、排序）。"""
+        seen: dict[str, None] = {}
+        for devices in self._brands.values():
+            for device in devices:
+                seen.setdefault(device["bin"], None)
+        return sorted(seen)
+
+    def devices_by_bin(self) -> dict[str, list[tuple[str, str]]]:
+        """bin -> [(品牌, 型号名), ...]（同一 bin 可能被多个品牌共用）。"""
+        out: dict[str, list[tuple[str, str]]] = {}
+        for brand, devices in self._brands.items():
+            for device in devices:
+                out.setdefault(device["bin"], []).append((brand, device["device_name"]))
+        return out
+
+    def brands_of(self, bin_name: str) -> list[str]:
+        """该 bin 被哪些品牌共用（去重、按索引顺序）。
+
+        一个 bin 常被多个品牌共用（509 个里 149 个；最多的一个有 216 个品牌），
+        所以"这台空调是什么牌子"从 bin 反查不出来，只能拿到一份候选品牌名单。
+        """
+        out: dict[str, None] = {}
+        for brand, devices in self._brands.items():
+            for device in devices:
+                if device["bin"] == bin_name:
+                    out.setdefault(brand, None)
+        return list(out)
+
+    def brand_of(self, bin_name: str) -> str:
+        """反查 bin 所属品牌（多个品牌共用时取第一个；想要全名单用 `brands_of`）。"""
+        return next(iter(self.brands_of(bin_name)), "")
+
+    def read_raw(self, bin_name: str) -> bytes:
+        """直接读 bin 原始字节。
+
+        不走 `load_device` 的解码缓存 —— 学习匹配是"读一次、用完就扔"，
+        缓存整台空调的 300 帧会把内存吃光。
+        """
+        with open(os.path.join(self._path, "codes", bin_name), "rb") as handle:
+            return handle.read()
+
     def load_device(self, bin_name: str) -> dict:
-        """解码一个型号（带缓存 —— 同一 bin 在多个品牌下重复出现）。"""
+        """解码一个型号（带缓存 —— 同一 bin 可能在多个品牌下重复出现）。"""
         cached = self._decoded.get(bin_name)
         if cached is not None:
             return cached

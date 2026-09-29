@@ -2,10 +2,11 @@
   "config": {
     "step": {
       "user": {
-        "title": "IR Hub — Pick a transmitter type",
-        "description": "Bundled library: {devices} remotes + 1053 AC models.\n\nPick how frames get transmitted: a self-built ESPHome infrared emitter (recommended), an off-the-shelf Broadlink, an MQTT gateway running Tasmota IRMQTTServer, or any ESPHome action that accepts raw timings (SmartAC-compatible).",
+        "title": "IR Hub — transmitter type & setup mode",
+        "description": "Bundled library: {devices} key-based remotes + a full AC state-code library.\n\n**Transmitter type**: a self-built ESPHome infrared emitter (recommended), an off-the-shelf Broadlink, an MQTT gateway running Tasmota IRMQTTServer, or any ESPHome action that accepts raw timings (SmartAC-compatible).\n\n**Setup mode**: Manual = browse category → brand → model; Pair with remote = point the ORIGINAL remote at an IR receiver, press a key, and the code is looked up automatically (works for key-based devices AND air conditioners; much faster when the model is unknown).",
         "data": {
-          "tx_type": "Transmitter type"
+          "tx_type": "Transmitter type",
+          "mode": "Setup mode"
         }
       },
       "tx": {
@@ -37,6 +38,41 @@
           "test_result": "Did the device react?"
         }
       },
+      "learn_setup": {
+        "title": "IR Hub — Pair with remote: receiver & category",
+        "description": "Channel: **{tx_type}**\nTarget: {tx_target_hint}\n\nPick the **IR receiver** (library date: {generated}) and the **device category**.\n\n⚠️ Point the original remote at the receiver, 5–30 cm away. The category matters: matching only searches WITHIN it, so a wrong category finds nothing. Air conditioners can be paired too: pick \"Air conditioner · thermostat\" and press the POWER key on the AC remote.",
+        "data": {
+          "tx_target": "Transmitter target",
+          "receiver": "IR receiver",
+          "category": "Device category"
+        }
+      },
+      "learn_press": {
+        "title": "IR Hub — Key {seq}: press the remote",
+        "description": "Receiver: **{receiver}**\n\nPoint the original remote at the receiver, press **{key_hint}**, then hit Submit.\n\n({captured} frame(s) captured; if none, press again and submit again.)",
+        "data": {}
+      },
+      "learn_press2": {
+        "title": "IR Hub — Key {seq} (optional): narrow the model",
+        "description": "Receiver: **{receiver}**\n\nPress **{key_hint}** and submit — intersecting two keys filters out most same-code / look-alike models (extra useful for air conditioners: models in the same protocol family are indistinguishable from the power key alone).\n\nOr pick \"Skip\" to match on the power key only (more candidates). {captured} frame(s) captured.",
+        "data": {
+          "learn_action": "Next"
+        }
+      },
+      "learn_pick": {
+        "title": "IR Hub — Confirm the matched model",
+        "description": "Matched **{count}** candidate models in **{category}** ({keys}, best similarity {score}).\n\nCandidates are ranked by similarity — find your own brand/model. Models of the same protocol family show up together (their codes are nearly identical, so any of them usually works); a brand match is the safest pick. A candidate labelled \"shared by N brands\" is a **generic code**, not a wrong match.\n\nA test frame is sent next (air conditioners get a two-stage power-on → power-off confirmation).",
+        "data": {
+          "device": "Model"
+        }
+      },
+      "learn_test": {
+        "title": "IR Hub — Confirm with a test frame",
+        "description": "**A test frame (key: {key}) was just sent to {model}.**\n\nPick \"It worked\" to finish; otherwise \"Back to candidates\" to try the next-best candidate.",
+        "data": {
+          "test_result": "Did the device react?"
+        }
+      },
       "ac_brand": {
         "title": "IR Hub — Pick an AC brand",
         "description": "Air conditioners use the irext state-code library ({count} brands / {devices} models).\n\nYou will get a **real thermostat panel** (native mode/temperature/fan controls) — no SmartIR/SmartAC needed.",
@@ -53,14 +89,14 @@
       },
       "ac_test_on": {
         "title": "IR Hub — AC power-ON test frame sent",
-        "description": "**An ON frame (26°C / auto fan) was just sent to {brand} ({index}/{total}: model {model}).**\n\nIf the AC beeped or started blowing, pick \"It worked\" — an OFF frame follows for a second confirmation; otherwise \"Try next model automatically\" or go back and pick manually. Choose \"Skip\" if you are not near the unit.",
+        "description": "**An ON frame (26°C / auto fan) was just sent ({brand} · candidate {index}/{total}: model {model}).**\n\nIf the AC beeped or started blowing, pick \"It worked\" — an OFF frame follows for a second confirmation; otherwise \"Try next model automatically\" or go back and pick manually. Choose \"Skip\" if you are not near the unit.",
         "data": {
           "test_result": "Did the AC turn ON?"
         }
       },
       "ac_test": {
         "title": "IR Hub — AC power-OFF test frame sent",
-        "description": "**An OFF frame was just sent to {brand} ({index}/{total}: model {model}).**\n\nIf the AC beeped or powered down, pick \"It worked\" to finish; otherwise \"Try next model automatically\" or go back and pick manually. Choose \"Skip\" if you are not near the unit.",
+        "description": "**An OFF frame was just sent ({brand} · candidate {index}/{total}: model {model}).**\n\nIf the AC beeped or powered down, pick \"It worked\" to finish; otherwise \"Try next model automatically\" or go back and pick manually. Choose \"Skip\" if you are not near the unit.",
         "data": {
           "test_result": "Did the AC turn OFF?"
         }
@@ -73,13 +109,17 @@
       "no_devices": "This brand has no models in the code library.",
       "device_gone": "That model is no longer in the code library.",
       "ac_decode_failed": "This model's code data failed to decode (corrupt irext data). Try another model.",
-      "test_exhausted": "Every model in this brand was tried with no reaction — check aim/line of sight, try another carrier (56k) in the options, or pick a different brand."
+      "test_exhausted": "Every model in this brand was tried with no reaction — check aim/line of sight, try another carrier (56k) in the options, or pick a different brand.",
+      "no_receivers": "No infrared receiver found. Add a receiver entity on an ESPHome device (an `infrared:` entry using `ir_rf_proxy`, or `remote_receiver` plus an infrared platform) first, then reload this integration.",
+      "receiver_api_missing": "This Home Assistant version's infrared integration has no RECEIVER API yet (receiving was added after the 2026.4 emitter support). Upgrade Home Assistant to a version with the IR receiver entity, or use \"Manual\" setup.",
+      "learn_no_match": "No model matched in the selected category. Check: (1) is the category correct (matching only searches within it); (2) is the remote aimed at the receiver (5–30 cm); (3) does the library even contain this remote (try \"Manual\" and browse by brand)."
     },
     "error": {
       "send_failed": "Sending the test frame failed (emitter offline or refused). Retry later, skip the test, or go back.",
       "no_test_key": "This model has no usable test code in the library. You can skip the test and finish anyway.",
       "target_missing": "The transmitter target does not exist or is unavailable (entity offline / ESPHome action not registered / Broadlink entity missing). Check and retry.",
-      "mqtt_missing": "The MQTT integration is not loaded — configure an MQTT broker in HA first, then use the MQTT channel."
+      "mqtt_missing": "The MQTT integration is not loaded — configure an MQTT broker in HA first, then use the MQTT channel.",
+      "no_signal": "No infrared signal captured. Point the remote AT the receiver (5–30 cm), press again, then submit again. Check the batteries too."
     }
   },
   "options": {

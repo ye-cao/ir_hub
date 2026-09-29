@@ -1,31 +1,27 @@
-"""button 平台 —— 每个按键一个 button 实体。
+"""button 平台 —— 每个可用按键一个 button 实体。
 
-为什么值得有（而不是只用 `remote` 实体）：
+为什么要有（而不只是 `remote` 实体）：
 
-  · `remote` 实体的用法是"先选 activity、再调服务"，做 dashboard 得写
-    `perform-action` 那一串 YAML（见 README「做面板」一节）。
-  · button 实体在 dashboard 上就是**一排按钮，点一下即发** —— 这才是遥控器该有的样子，
-    而且天然支持 `button.press`，自动化里调用也最直接。
-  · 只给**有有效码**的键生成 button（`CodeLibrary.key_names()` 已经滤掉占位键，
-    不会生成点不动的按钮）。
+  · `remote` 的用法是"先选 activity、再调服务"，做面板得写一串 perform-action YAML。
+  · button 在面板上就是一排按钮，点一下即发 —— 遥控器该有的样子，
+    自动化里 `button.press` 也最直接。
+  · 只为**有有效码**的键生成（`CodeLibrary.key_names()` 已滤掉占位键）。
 
-发码路径与 `remote.py` **完全一致**（同一个 emitter、同一套 carrier / repeats、
-同样只把码库里的带符号时序交给 `build_raw_command`），差别只在触发方式。
+发码路径与 `remote.py` 完全一致（同一个 emitter、同一套 carrier / repeats），
+差别只在触发方式。
 
-⚠️ **关于 entity_id（这是本平台唯一需要小心的地方）**：
+⚠️ entity_id（本平台唯一需要小心的地方）：
 
-按键名里的 `+` / `-` 经 HA 的 slugify 之后**会整个消失** —— 实测
-`vol+` 和 `vol-` 都变成 `vol`，`page+` / `page-` 都变成 `page`。
-一个设备同时有这两组键是常态（实测 TCL电视-1 就同时有 vol+/vol-），
-若交给 HA 自动生成 id，后者会被加后缀成 `_2`，用户根本分不清哪个是加哪个是减。
+按键名里的 `+` / `-` 经 HA 的 slugify 会整个消失 —— `vol+` 和 `vol-` 都变成
+`vol`。一台设备同时有这两组键是常态，交给 HA 自动生成 id 的话后者会被加后缀
+成 `_2`，用户分不清哪个是加哪个是减。
 
-所以本平台**显式指定 `entity_id`**，把符号映射成词：
+所以本平台**显式指定 entity_id**，把符号映射成词：
 
     vol+  -> button.<设备>_vol_plus
     vol-  -> button.<设备>_vol_minus
-    page+ -> button.<设备>_page_plus
 
-而**显示名保持原始按键名**（`vol+`）—— 好看好认，两者互不干扰。
+显示名则保持原始按键名（`vol+`），好看好认，两者互不干扰。
 """
 
 from __future__ import annotations
@@ -69,11 +65,10 @@ _LOGGER = logging.getLogger(__name__)
 # 红外是单向的，没有可读状态 —— 不轮询
 PARALLEL_UPDATES = 0
 
-# entity_id 用的符号映射（见模块 docstring）。顺序重要：`+` 要在 `-` 之前处理无所谓，
-# 但两者都不会互相影响，因为替换是独立字符。
+# entity_id 里的符号映射（见模块 docstring）
 _ID_SYMBOLS = (("+", "_plus"), ("-", "_minus"))
 
-# 按常用按键给个像样的图标（认不出的就不设，HA 用 button 默认图标）
+# 常用按键的图标（认不出的不设，HA 用 button 默认图标）
 _ICONS: dict[str, str] = {
     "power": "mdi:power",
     "mute": "mdi:volume-off",
@@ -108,12 +103,12 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up one button entity per usable key of this device."""
+    """为该设备的每个可用按键建一个 button 实体。"""
     library: CodeLibrary = hass.data[DOMAIN][entry.entry_id]
     data = {**entry.data, **entry.options}
 
     if data.get(CONF_CATEGORY) == CATEGORY_AC:
-        # 空调条目走 climate 平台（状态机码库没有"按键"可言）
+        # 空调条目走 climate 平台（状态码库没有"按键"可言）
         _LOGGER.debug("IR Hub: AC entry %s -> climate platform, button skipped", entry.entry_id)
         return
 
@@ -132,11 +127,11 @@ async def async_setup_entry(
         return
 
     brand = library.brands.get(device["brand"]) or f"品牌 {device['brand']}"
-    # 与 remote 平台用同一个显示名 ⇒ 两组实体归到同一个 HA 设备、前缀也一致
+    # 与 remote 平台用同一个显示名 ⇒ 两组实体归到同一个 HA 设备、前缀一致
     display = library.display_name(brand, device["name"])
     device_domain_slug = ha_slugify(display)
 
-    # 与 remote.py 一致的 DeviceInfo —— identifiers 相同 ⇒ HA 认为是同一台设备
+    # 与 remote.py 相同的 DeviceInfo —— identifiers 一致 ⇒ HA 认为是同一台设备
     device_info = DeviceInfo(
         identifiers={(DOMAIN, entry.entry_id)},
         name=display,
@@ -147,7 +142,7 @@ async def async_setup_entry(
 
     carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
     repeats = max(1, int(data.get(CONF_REPEATS) or DEFAULT_REPEATS))
-    # 发射通道（旧条目只有 CONF_EMITTER ⇒ 兼容回退为 infrared）
+    # 发射通道（旧条目只有 CONF_EMITTER ⇒ 回退为 infrared）
     tx_type = data.get(CONF_TX_TYPE) or TX_INFRARED
     tx_target = data.get(CONF_TX_TARGET) or data.get(CONF_EMITTER) or ""
     tx_delay = float(data.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY)
@@ -175,15 +170,13 @@ async def async_setup_entry(
 
 
 class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
-    """One key of one irext device, as a pressable button.
+    """irext 设备的一个按键，做成可按的按钮。
 
     多重继承说明（与 `remote.py` 同构）：
-      · `InfraredEmitterConsumerEntity` 提供 `_send_command()` 与**自动跟随 emitter
-        可用性**（emitter 掉线 → 本实体 unavailable；上线 → 自动恢复），
+      · `InfraredEmitterConsumerEntity` 提供 `_send_command()` 与**自动跟随
+        emitter 可用性**（emitter 掉线 → 实体 unavailable，上线自动恢复），
         满足官方对 consumer 的要求（不得直接调 `InfraredEmitterEntity.async_send_command`）。
       · `ButtonEntity` 提供 `button.press` 契约（实现 `async_press`）。
-    MRO：IrHubButton → InfraredEmitterConsumerEntity → InfraredConsumerEntity
-         → ButtonEntity → Entity
     """
 
     _attr_has_entity_name = True
@@ -205,8 +198,8 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         device_info: DeviceInfo,
         entity_id: str,
     ) -> None:
-        # 与 remote.py 同理：HA 当前的 Entity 没有 __init__，但调了不亏
-        # （将来 HA 若给 Entity.__init__ 加东西，不会静默跳过）。
+        # 与 remote.py 同理：HA 当前的 Entity 没有 __init__，但调了不亏，
+        # 将来 HA 若给 Entity.__init__ 加东西也不会被静默跳过。
         super().__init__()
 
         self._library = library
@@ -214,8 +207,8 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         self._device_id = int(device["id"])
         self._key = key
 
-        # 发射通道：infrared 通道下基类靠 _infrared_emitter_entity_id 跟踪
-        # 可用性；其它通道跟踪被 async_added_to_hass 跳过，发码走 transmitter。
+        # 发射通道：infrared 通道下基类靠 _infrared_emitter_entity_id 跟踪可用性；
+        # 其它通道跳过跟踪（见 async_added_to_hass），发码走 transmitter。
         self._tx_type = tx_type
         self._tx_target = tx_target
         self._tx_delay = tx_delay
@@ -226,22 +219,22 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         self._repeats = repeats
 
         self._attr_unique_id = f"{entry.entry_id}_{key_object_id(key)}"
-        # 显示名 = 原始按键名（'vol+' 而不是 'vol_plus'），好看好认
+        # 显示名 = 原始按键名（'vol+' 而不是 'vol_plus'）
         self._attr_name = key
         self._attr_device_info = device_info
         self._attr_icon = _ICONS.get(key)
 
-        # ⭐ 显式 entity_id：符号已在 key_object_id 里变成词，保证同一设备内唯一，
-        #    不会出现 vol+ / vol- 都被 slugify 成 `vol` 而让 HA 加 `_2` 的情况。
+        # 显式 entity_id：符号已变成词，保证同一设备内唯一，
+        # 不会出现 vol+ / vol- 都被 slugify 成 `vol` 而让 HA 加 `_2`。
         self.entity_id = entity_id
 
     async def async_added_to_hass(self) -> None:
-        """infrared 通道跟随 emitter 可用性；其它通道无实体状态可跟，恒可用。"""
+        """infrared 通道跟随 emitter 可用性；其它通道无状态可跟，恒可用。"""
         if self._tx_type == TX_INFRARED:
             await super().async_added_to_hass()
 
     async def _send_command(self, command) -> None:
-        """按通道路由：infrared 走 consumer 基类；其余由 transmitter 打包发服务。"""
+        """按通道路由：infrared 走 consumer 基类；其余交给 transmitter 打包发服务。"""
         if self._tx_type == TX_INFRARED:
             await super()._send_command(command)
             return
@@ -260,7 +253,7 @@ class IrHubButton(InfraredEmitterConsumerEntity, ButtonEntity):
         timings = self._library.get_timings(self._device_id, self._key)
         if timings is None:
             # 理论上不会发生（key_names() 只返回有有效码的键），
-            # 但码库若被换掉就可能 —— 报清楚，别静默。
+            # 但码库被换掉就可能 —— 报清楚，别静默。
             raise HomeAssistantError(
                 f"IR Hub: 设备 {self._device['name']} 的按键 '{self._key}' 现在读不到有效码"
                 f"（码库更新过？请重加集成）"
