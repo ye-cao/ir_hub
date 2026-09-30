@@ -149,6 +149,12 @@ _TX_TARGET_LABELS = {
     TX_BROADLINK: "下拉选择 Broadlink 的 remote 实体",
     TX_MQTT: "如 tcl_ir/ir_send（SmartAC/tcl-ir 桥，裸数组）；Tasmota 固件也可",
 }
+# 空调条目选项里的传感器说明（其它条目这个占位符填空串，整段不显示）
+_SENSORS_HINT = (
+    "可选传感器（留空 = 不用）：温度 / 湿度只用于在恒温器卡片上**显示**室温湿度；"
+    "功率 = 接空调的智能插座，ON/OFF 用来同步「物理遥控器开了 / 关了空调」"
+    "（只看开关，不看瓦数）。"
+)
 
 
 class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -1561,28 +1567,33 @@ class IrHubOptionsFlow(config_entries.OptionsFlow):
                     defaults=user_input,
                     errors={"base": error},
                 )
-            return self.async_create_entry(
-                title="",
-                data={
-                    CONF_CARRIER: user_input[CONF_CARRIER],
-                    CONF_REPEATS: user_input[CONF_REPEATS],
-                    CONF_TX_DELAY: user_input[CONF_TX_DELAY],
-                    CONF_TX_TYPE: tx_type,
-                    CONF_TX_TARGET: tx_target,
-                    CONF_MQTT_FORMAT: (
-                        user_input.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT
-                    ),
-                    CONF_TEMPERATURE_SENSOR: (
-                        str(user_input.get(CONF_TEMPERATURE_SENSOR) or "").strip()
-                    ),
-                    CONF_HUMIDITY_SENSOR: (
-                        str(user_input.get(CONF_HUMIDITY_SENSOR) or "").strip()
-                    ),
-                    CONF_POWER_SENSOR: (
-                        str(user_input.get(CONF_POWER_SENSOR) or "").strip()
-                    ),
-                },
-            )
+            data = {
+                CONF_CARRIER: user_input[CONF_CARRIER],
+                CONF_REPEATS: user_input[CONF_REPEATS],
+                CONF_TX_DELAY: user_input[CONF_TX_DELAY],
+                CONF_TX_TYPE: tx_type,
+                CONF_TX_TARGET: tx_target,
+                CONF_MQTT_FORMAT: (
+                    user_input.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT
+                ),
+            }
+            # 传感器只有空调条目在读 —— 非空调条目连表单都不显示这几个字段，
+            # 保存时也不要往 entry 里写空串（保持 entry 干净）。
+            if current.get(CONF_CATEGORY) == CATEGORY_AC:
+                data.update(
+                    {
+                        CONF_TEMPERATURE_SENSOR: str(
+                            user_input.get(CONF_TEMPERATURE_SENSOR) or ""
+                        ).strip(),
+                        CONF_HUMIDITY_SENSOR: str(
+                            user_input.get(CONF_HUMIDITY_SENSOR) or ""
+                        ).strip(),
+                        CONF_POWER_SENSOR: str(
+                            user_input.get(CONF_POWER_SENSOR) or ""
+                        ).strip(),
+                    }
+                )
+            return self.async_create_entry(title="", data=data)
 
         self._render_tx_type = render_type
         return self._async_show_options_form(current, tx_type=render_type)
@@ -1594,8 +1605,14 @@ class IrHubOptionsFlow(config_entries.OptionsFlow):
         defaults: dict | None = None,
         errors: dict | None = None,
     ):
-        """画选项表单。`defaults` 是上一把提交里用户已填的值（换通道重画时保留）。"""
+        """画选项表单。`defaults` 是上一把提交里用户已填的值（换通道重画时保留）。
+
+        ⚠️ 传感器字段**只有空调条目显示** —— 温湿度/功率是 climate 实体在读，
+        电视/机顶盒（remote/button）条目根本没有这些消费方，显示出来只会让人
+        以为漏配了什么。
+        """
         values = {**current, **(defaults or {})}
+        is_ac = current.get(CONF_CATEGORY) == CATEGORY_AC
         schema = {
             vol.Required(
                 CONF_CARRIER,
@@ -1615,21 +1632,26 @@ class IrHubOptionsFlow(config_entries.OptionsFlow):
                 CONF_TX_TARGET,
                 default=str(values.get(CONF_TX_TARGET) or ""),
             ): self._tx_target_validator(tx_type, str(values.get(CONF_TX_TARGET) or "")),
-            # 可选传感器：留空 = 不用。手填实体 id（对齐 SmartAC 的自由文本 ——
-            # 模板传感器可能还没建出来，下拉反而会卡住人）
-            vol.Optional(
-                CONF_TEMPERATURE_SENSOR,
-                default=str(values.get(CONF_TEMPERATURE_SENSOR) or ""),
-            ): str,
-            vol.Optional(
-                CONF_HUMIDITY_SENSOR,
-                default=str(values.get(CONF_HUMIDITY_SENSOR) or ""),
-            ): str,
-            vol.Optional(
-                CONF_POWER_SENSOR,
-                default=str(values.get(CONF_POWER_SENSOR) or ""),
-            ): str,
         }
+        # 可选传感器：只有空调条目有 climate 实体在读。留空 = 不用；手填实体 id
+        # （对齐 SmartAC 的自由文本 —— 模板传感器可能还没建出来，下拉反而卡人）
+        if is_ac:
+            schema.update(
+                {
+                    vol.Optional(
+                        CONF_TEMPERATURE_SENSOR,
+                        default=str(values.get(CONF_TEMPERATURE_SENSOR) or ""),
+                    ): str,
+                    vol.Optional(
+                        CONF_HUMIDITY_SENSOR,
+                        default=str(values.get(CONF_HUMIDITY_SENSOR) or ""),
+                    ): str,
+                    vol.Optional(
+                        CONF_POWER_SENSOR,
+                        default=str(values.get(CONF_POWER_SENSOR) or ""),
+                    ): str,
+                }
+            )
         # MQTT 载荷格式只有 mqtt 通道有意义（smartac 裸数组 / tasmota RAW JSON）
         if tx_type == TX_MQTT:
             schema[vol.Required(
@@ -1645,6 +1667,10 @@ class IrHubOptionsFlow(config_entries.OptionsFlow):
                 "title": self.config_entry.title,
                 "tx_type": dict(TX_TYPE_OPTIONS).get(tx_type, tx_type),
                 "tx_target_hint": _TX_TARGET_LABELS.get(tx_type, ""),
+                # 传感器说明只有空调条目才有意义（空串 = 整段不显示）
+                "sensors_hint": (
+                    _SENSORS_HINT if is_ac else ""
+                ),
             },
         )
 

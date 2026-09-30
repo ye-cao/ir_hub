@@ -128,7 +128,7 @@
     "step": {
       "init": {
         "title": "IR Hub 设置",
-        "description": "「{title}」的设置。\n\n载波频率：绝大多数设备是 38000 Hz。**别相信码库里的协议名** —— 若设备没反应，在这里换 56000（或 40000）试试。\n发送次数：每按一次实际发几遍（1 = 只发一遍）。若设备「隔一次才响应」就把这个调大。\nBroadlink 延迟：仅 Broadlink 通道有效（两次发送之间的间隔秒数）。\nMQTT 载荷格式：仅 MQTT 通道有效。smartac = 裸时序数组（tcl-ir 等桥接固件，默认）；tasmota = Tasmota IRMQTTServer RAW JSON。\n\n**发射通道**：可以直接换（infrared / Broadlink / ESPHome / MQTT）—— 不用删了重加集成，也不用重新配对。\n目标：infrared / Broadlink 是下拉选择实体；ESPHome / MQTT 是手填（{tx_target_hint}）。\n\n可选传感器（留空 = 不用）：温度 / 湿度只用于在恒温器卡片上**显示**室温湿度；功率 = 接空调的智能插座，ON/OFF 用来同步「物理遥控器开了 / 关了空调」（只看开关，不看瓦数）。",
+        "description": "「{title}」的设置。\n\n载波频率：绝大多数设备是 38000 Hz。**别相信码库里的协议名** —— 若设备没反应，在这里换 56000（或 40000）试试。\n发送次数：每按一次实际发几遍（1 = 只发一遍）。若设备「隔一次才响应」就把这个调大。\nBroadlink 延迟：仅 Broadlink 通道有效（两次发送之间的间隔秒数）。\nMQTT 载荷格式：仅 MQTT 通道有效。smartac = 裸时序数组（tcl-ir 等桥接固件，默认）；tasmota = Tasmota IRMQTTServer RAW JSON。\n\n**发射通道**：可以直接换（infrared / Broadlink / ESPHome / MQTT）—— 不用删了重加集成，也不用重新配对。\n目标：infrared / Broadlink 是下拉选择实体；ESPHome / MQTT 是手填（{tx_target_hint}）。\n\n{sensors_hint}\n传感器只有**空调条目**才显示（电视/机顶盒用不到）。",
         "data": {
           "carrier": "载波频率 (Hz)",
           "repeats": "发送次数",

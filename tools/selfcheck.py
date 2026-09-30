@@ -2129,11 +2129,39 @@ def check_config_flow() -> None:
             == {EMITTER: None},
             "options 的发射目标按通道出下拉（infrared -> emitter 实体）",
         )
+        # 传感器字段**只有空调条目显示**（2026-09-30 用户指正：电视/机顶盒用不到）
         check(
-            _schema_defaults(options.shown["data_schema"]).get("temperature_sensor") == ""
-            and _schema_defaults(options.shown["data_schema"]).get("humidity_sensor") == ""
-            and _schema_defaults(options.shown["data_schema"]).get("power_sensor") == "",
-            "可选传感器三个字段默认空（留空 = 不用）",
+            all(
+                _schema_defaults(options.shown["data_schema"]).get(k) is None
+                for k in ("temperature_sensor", "humidity_sensor", "power_sensor")
+            )
+            and options.shown["description_placeholders"]["sensors_hint"] == "",
+            "非空调条目 -> 选项里不出现传感器字段（说明占位符也是空）",
+            f"实际 defaults={_schema_defaults(options.shown['data_schema'])!r}",
+        )
+
+        class FakeAcEntry(FakeEntry):
+            data = {
+                **FakeEntry.data,
+                "category": "ac",
+                "device": "irda_new_ac_11272.bin",
+            }
+
+        options = flow_mod.IrHubOptionsFlow()
+        options.hass = FakeHass()
+        options.config_entry = FakeAcEntry()
+        await options.async_step_init()
+        ac_defaults = _schema_defaults(options.shown["data_schema"])
+        check(
+            ac_defaults.get("temperature_sensor") == ""
+            and ac_defaults.get("humidity_sensor") == ""
+            and ac_defaults.get("power_sensor") == "",
+            "空调条目 -> 可选传感器三个字段出现且默认空（留空 = 不用）",
+            f"实际 {ac_defaults!r}",
+        )
+        check(
+            options.shown["description_placeholders"]["sensors_hint"] != "",
+            "空调条目 -> 传感器说明占位符非空",
         )
         _full = {
             "carrier": 38000, "repeats": 1, "tx_delay": 0.5,
@@ -2150,7 +2178,7 @@ def check_config_flow() -> None:
         # 保存：tx 字段 + 传感器一起写进 options（HA 会自动 reload 条目）
         options = flow_mod.IrHubOptionsFlow()
         options.hass = FakeHass()
-        options.config_entry = FakeEntry()
+        options.config_entry = FakeAcEntry()
         await options.async_step_init({
             **_full, "carrier": 56000, "repeats": 2, "tx_delay": 1.5,
             "temperature_sensor": "sensor.room_temp",
@@ -3224,18 +3252,18 @@ def main() -> int:
     #           并真的发出 / fan_only+30°C 照样发 / cool+35°C 收敛到 30 /
     #           切模式收敛风速 / set_swing_mode 的帧与 off 档不同 /
     #           无摆风的型号不声明 SWING_MODE                            +11
-    #      + 0.3.12 SmartAC 移植 18 项（本段新增）：
+    #      + 0.3.12 SmartAC 移植 20 项（本段新增）：
     #        ① 翻译 2 项（每语言 options init data 9 键 + options.error 覆盖
     #           target_missing/mqtt_missing —— 按语言循环展开）
-    #        ② options flow 7 项（下拉按通道出 / 传感器默认空 / Coerce /
-    #           完整保存 tx+传感器 / 旧 emitter 留在下拉 / 失效目标提交被拦 /
-    #           换通道重画且保留已填值 + mqtt 保存 = ⑦⑧ 重写后共 13 项，
-    #           旧 6 项 => 净 +7）
+    #        ② options flow 9 项（下拉按通道出 / 非空调条目不出现传感器字段 /
+    #           空调条目传感器默认空 + 说明非空 / Coerce / 完整保存 tx+传感器 /
+    #           旧 emitter 留在下拉 / 失效目标提交被拦 / 换通道重画且保留已填值
+    #           + mqtt 保存 = ⑦⑧ 共 15 项，旧 6 项 => 净 +9）
     #        ③ climate 传感器 9 项（配传感器挂 3 订阅 / 无传感器上报时不伪造
     #           current_* / 无历史状态也挂订阅 / added 时读现值 / unknown 跳过
     #           26.0 生效 / 功率 ON 同步开机且不发红外 / on->on 忽略 /
     #           功率 OFF 同步关机 / 没配传感器零订阅）
-    expected_total = 296
+    expected_total = 298
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(
