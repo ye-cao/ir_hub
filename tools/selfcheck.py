@@ -1660,6 +1660,104 @@ def check_config_flow() -> None:
             "learn_press 无信号 -> errors.no_signal（订阅保持，不用重进这一步）",
         )
 
+        # ---- 回调侧账本：把"没信号"拆到具体一环 ----
+        # 实测踩到（用户截图）：接收器 state 明明在跳时间戳（帧进了 HA），界面上却只有一句
+        # 笼统的"没有捕获到红外信号" —— 帧到了 `_learn_on_signal` 之后被 `normalize_capture`
+        # 静默丢掉，不留痕迹。下面把四种断法逐一钉住，尤其不能把它们混成一句。
+        saved_subs_diag = list(infrared.STUB_SUBSCRIBERS)
+        probe = FakeStates.extra.get(RECEIVER)
+        saved_probe_state = getattr(probe, "state", None)
+        try:
+            fl_diag = new_flow()
+            await fl_diag.async_step_user({"tx_type": "infrared", "mode": "learn"})
+            await fl_diag.async_step_learn_setup(
+                {"tx_target": EMITTER, "receiver": RECEIVER, "category": "2"}
+            )
+            # 首次打开这一页时用户还没按遥控器 —— 此时挂判词必然误报"帧根本没进 HA"。
+            check(
+                fl_diag.shown["description_placeholders"].get("capture_diag") == "",
+                "learn_press 首次打开不带诊断判词（用户还没按，挂出来必然误报）",
+                f"实际 {fl_diag.shown['description_placeholders'].get('capture_diag')!r}",
+            )
+
+            # A. 没按 + state 未变 -> 帧根本没进 HA（去查接收器/对准）
+            FakeStates.extra[RECEIVER].state = "unknown"
+            await fl_diag.async_step_learn_press({})
+            diag_a = fl_diag.shown["description_placeholders"].get("capture_diag", "")
+            check(
+                "帧根本没进 HA" in diag_a and "remote.pronto" in diag_a,
+                "0 帧 + state 未变 -> 判词直指「帧没进 HA」并给出 ESPHome 日志核对法",
+                f"实际 {diag_a[:70]!r}",
+            )
+
+            # B. state 已前进但回调 0 次 -> 帧进了 HA、断在订阅上（与 A 处置相反）
+            FakeStates.extra[RECEIVER].state = "2026-09-30T01:58:20.927+00:00"
+            await fl_diag.async_step_learn_press({})
+            diag_b = fl_diag.shown["description_placeholders"].get("capture_diag", "")
+            check(
+                "帧进了 HA" in diag_b
+                and "订阅" in diag_b
+                and fl_diag._learn_raw_events == 0,
+                "state 前进但回调 0 次 -> 判词区分开「帧进了 HA，断在订阅」（与「帧没进 HA」相反）",
+                f"实际 raw_events={fl_diag._learn_raw_events} diag={diag_b[:50]!r}",
+            )
+
+            # C. 重进本步（重置账本）后灌一帧含 0 的 -> 回调有事件但被丢
+            await fl_diag.async_step_learn_press()
+            infrared.STUB_EMIT_RECEIVED(RECEIVER, [9000, 0, 560, -560] * 4)
+            await fl_diag.async_step_learn_press({})
+            diag_c = fl_diag.shown["description_placeholders"].get("capture_diag", "")
+            check(
+                "含 0" in diag_c
+                and "不是" in diag_c
+                and "码库" in diag_c
+                and fl_diag._learn_raw_events == 1,
+                "帧含 0 -> 判词点名原因，并明确「不是码库的问题」（账本记到 1 次）",
+                f"实际 raw={fl_diag._learn_raw_events} drops={fl_diag._learn_dropped}",
+            )
+
+            # D/E. 再灌两帧坏帧（不重置）-> 账本按原因**分类累计**，判词一次列全
+            infrared.STUB_EMIT_RECEIVED(RECEIVER, [9000, -4500, 560])
+            await fl_diag.async_step_learn_press({})
+            diag_d = fl_diag.shown["description_placeholders"].get("capture_diag", "")
+            check(
+                "太短" in diag_d and "3 段" in diag_d,
+                "帧太短（3 段）-> 判词点名「太短（只有 3 段…）」",
+                f"实际 {diag_d[:70]!r}",
+            )
+
+            infrared.STUB_EMIT_RECEIVED(
+                RECEIVER, [9000, -4500, "x", -560, 560, -560, 560, -560]
+            )
+            await fl_diag.async_step_learn_press({})
+            diag_e = fl_diag.shown["description_placeholders"].get("capture_diag", "")
+            check(
+                "非数字" in diag_e,
+                "时序含非数字项 -> 判词单独点名（与「含 0」「太短」分开）",
+                f"实际 {diag_e[:70]!r}",
+            )
+
+            # F. 分类器互不混淆 + 账本累计 + 留下原始样本（供反向复现）
+            drops = dict(fl_diag._learn_dropped)
+            check(
+                fl_diag._classify_drop([1, 0, 2, 3, 4, 5, 6, 7])
+                == "时序里含 0（奇偶会错位）"
+                and fl_diag._classify_drop([1, 2, 3]).startswith("太短")
+                and fl_diag._classify_drop([1, "a", 3]) == "时序里有非数字项"
+                and fl_diag._classify_drop([1] * 8) == "时序不合法（未被接纳）"
+                and sum(drops.values()) == 3
+                and fl_diag._learn_last_raw
+                and fl_diag._learn_to_int("x") == "x",
+                "帧丢弃分类器 4 类互不混淆、账本累计 = 3、保留原始样本、非数字项容错",
+                f"实际 drops={drops} raw={fl_diag._learn_last_raw[:6]}",
+            )
+        finally:
+            # 这个探测流程是丢弃的，它订上的接收器不会自己退 ⇒ 复原订阅表，
+            # 否则后面「旧订阅已退、订阅数恰为 1」那条断言会被残留搞红。
+            infrared.STUB_SUBSCRIBERS[:] = saved_subs_diag
+            if probe is not None and saved_probe_state is not None:
+                probe.state = saved_probe_state
+
         lib = fl._library
         key1 = lib.key_names(lib.get_device(47))[0]
         t1 = lib.get_timings(47, key1)
@@ -1805,6 +1903,34 @@ def check_config_flow() -> None:
             AC_BIN in ac_opts and len(ac_opts) > 1,
             f"空调单键匹配候选含真值（{AC_BIN} 命中，共 {len(ac_opts)} 个候选）",
         )
+        # 结构预筛幸存数 = 「这一帧的形状库里有对应吗」。它是区分「库外遥控」与
+        # 「捕获被记坏」的唯一判别量 —— 这两者的**解法完全相反**，而旧界面把它们
+        # 混成了同一个低分，用户只能瞎试。
+        saved_top = fl_ac._learn_top_score
+        saved_surv = fl_ac._learn_ac_survivors
+        check(
+            saved_surv > 3,
+            f"真值帧的『结构预筛幸存数』已记录且远离阈值（幸存 {saved_surv} 个 bin）",
+            f"实际 _learn_ac_survivors={saved_surv}",
+        )
+        fl_ac._learn_top_score = 0.20
+        fl_ac._learn_ac_survivors = 1
+        verdict_gone = fl_ac._learn_verdict()
+        check(
+            "不在码库里" in verdict_gone and "手动选择码库" in verdict_gone,
+            "低分 + 幸存数 ≈1 -> 判词断定『不在码库里』（改走手动选型号，别重配对）",
+            f"实际 {verdict_gone[-90:]!r}",
+        )
+        fl_ac._learn_ac_survivors = 40
+        verdict_bad = fl_ac._learn_verdict()
+        check(
+            "记坏" in verdict_bad and "不在码库里" not in verdict_bad,
+            "低分 + 幸存数正常 -> 判词改说『捕获被接收端记坏』（与『不在库』结论相反）",
+            f"实际 {verdict_bad[-90:]!r}",
+        )
+        fl_ac._learn_top_score = saved_top
+        fl_ac._learn_ac_survivors = saved_surv
+
         AC_BRANDS = ac_lib.brands_of(AC_BIN)
         check(
             fl_ac.shown["description_placeholders"].get("category") == "空调"
@@ -2600,12 +2726,17 @@ def main() -> int:
     #      + learn_pick 3 项（「退回重按」出口 / {count} 不含该项 /
     #        摊开真实匹配数据 + 可信度判词）                          = 244
     #      + 「退回重按」导航 1 项（回 learn_press 且清空候选/捕获）   = 245
+    #      + 回调侧账本 7 项（首次打开不挂判词 / state 未变 = 帧没进 HA /
+    #        state 已变但回调 0 次 = 断在订阅 / 含 0 / 太短 / 非数字 /
+    #        分类器 4 类互不混淆 + 账本累计 = 3 + 留原始样本）          = 252
+    #      + 空调结构预筛幸存数 3 项（真值帧幸存数远离阈值 / 低分+幸存≈1 说
+    #        『不在码库』/ 低分+幸存正常 说『捕获被记坏』——两者结论相反）  = 255
     #        （⑪ 明细：选空调大类 / 捕获电源键 / 占位符改写 / 单键候选含真值 /
     #          共用码候选名不冒认品牌 / 进 ac_test_on + 真发帧 /
     #          共用码实测文案 / retry 退回候选 / ok 进 ac_test /
     #          entry 校验（共用码品牌留空）/ 跨品牌『自动试下一个』 /
     #          两键交集仍含真值）
-    expected_total = 245
+    expected_total = 255
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(

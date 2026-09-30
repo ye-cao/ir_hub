@@ -49,12 +49,12 @@
       },
       "learn_press": {
         "title": "IR Hub — Key {seq}: press the remote",
-        "description": "Receiver: **{receiver}**\nState: `{receiver_state}`{subscribe_error}\n\nPoint the original remote AT the receiver above, press **{key_hint}**, then Submit.\n\n> \"{captured} frames captured\" is a SNAPSHOT taken when this page opened — you press the remote afterwards, so it usually shows 0 and does NOT mean nothing was received. The frames actually used for matching are listed on the next screen.\n\n> The state is the probe: after pressing the remote it should turn into a timestamp. Unchanged = the frame never reached HA (the dropdown points at another device, or that device is offline). Changed but still \"no signal\" = the problem is in this integration; please report that line.",
+        "description": "Receiver: **{receiver}**\nState: `{receiver_state}`{subscribe_error}{capture_diag}\n\nPoint the original remote AT the receiver above, press **{key_hint}**, then Submit.\n\n> \"{captured} frames captured\" is a SNAPSHOT taken when this page opened — you press the remote afterwards, so it usually shows 0 and does NOT mean nothing was received. The frames actually used for matching are listed on the next screen.\n\n> The state is the probe: after pressing the remote it should turn into a timestamp (unchanged = the frame never reached HA). When a submit fails, the diagnosis below says exactly which link is broken.",
         "data": {}
       },
       "learn_press2": {
         "title": "IR Hub — Key {seq} (optional): narrow the model",
-        "description": "Receiver: **{receiver}**\nState: `{receiver_state}`{subscribe_error}\n\nPress **{key_hint}** once more and submit — intersecting both keys throws away most of the same-code / near-code models (air conditioners especially: same protocol family cannot be told apart from the power key alone).\n\nPick \"skip\" to match on the power key only (more candidates). Again, \"{captured} frames captured\" is a snapshot from when this page opened.",
+        "description": "Receiver: **{receiver}**\nState: `{receiver_state}`{subscribe_error}{capture_diag}\n\nPress **{key_hint}** once more and submit — intersecting both keys throws away most of the same-code / near-code models (air conditioners especially: same protocol family cannot be told apart from the power key alone).\n\nPick \"skip\" to match on the power key only (more candidates). Again, \"{captured} frames captured\" is a snapshot from when this page opened.",
         "data": {
           "learn_action": "Next"
         }

@@ -69,6 +69,30 @@ def bin_structures(ac_library) -> list[tuple[str, int, int]]:
     return out
 
 
+def structure_survivors(ac_library, captured: list[int]) -> int:
+    """只跑第 1 级（结构指纹预筛），数还剩多少个 bin —— 纯诊断用。
+
+    为什么要单独测这一级：`match_ac` 的最终候选数把"预筛灭了"和"逐帧打分没过"
+    混在一起，而这两者**处置完全不同**：
+
+    - 幸存数正常（十几~几十）但候选寥寥 → 帧长/引导码对得上，是逐帧分数低，
+      多半**捕获被接收端记坏了**（抖动/截断），换接收端或改善信号能救。
+    - 幸存数 ≈ 1~2 → 这一帧的结构在库里根本没有对应（`_prefilter_pass` 的帧长
+      只容差 ±3 段），基本可断定**这只遥控不在码库里**，再怎么调也配不上。
+
+    509 个 bin 的指纹有缓存，所以这条调用很便宜。
+    """
+    cap_variants = [capture_features(captured)]
+    if len(captured) > 9:
+        cap_variants.append(capture_features(captured[1:]))
+    return sum(
+        1
+        for _bin_name, count, first in bin_structures(ac_library)
+        # 第三个参数 0 = 与 match_ac 一致：首轮不检查总时长
+        if _prefilter_pass(cap_variants, count, first, 0)
+    )
+
+
 def _best_of_bin(
     ac_library,
     bin_name: str,

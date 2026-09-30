@@ -53,7 +53,7 @@ from .const import (
 )
 from .ir_command import build_raw_command
 from .learn_match import capture_features, match_timings, normalize_capture
-from .learn_match_ac import match_ac
+from .learn_match_ac import match_ac, structure_survivors
 from .library import CodeLibrary
 from .transmitter import async_send_timings, async_validate_target
 
@@ -179,11 +179,26 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._learn_capture2: list[int] | None = None
         self._learn_candidates: list | None = None   # int（按键类 id）或 str（空调 bin）
         self._learn_top_score: float = 0.0
+        # 空调专用诊断：结构指纹预筛后还剩多少个 bin。用来区分「库外遥控」与
+        # 「捕获被记坏」—— `match_ac` 的最终候选数把这两者混成同一个低分。
+        self._learn_ac_survivors: int = 0
         self._learn_used_two_keys: bool = False
         self._from_learn: bool = False               # 是否由"配对"分支进的空调实测步
         # 订阅接收器失败时的原因（空串 = 订阅正常）。必须留给用户看 —— 订阅失败与
         # "收到 0 帧"在界面上长得一模一样，吞掉就会变成无从下手的"没反应"。
         self._learn_subscribe_error: str = ""
+        # 回调侧账本：收了几次、接受几帧、丢掉几帧及原因。
+        # ⚠️ 实测踩到：接收器实体的 state 明明在跳时间戳（说明**帧进了 HA**），
+        # 界面上却只有一句笼统的"没有捕获到红外信号" —— 因为帧到了 `_learn_on_signal`
+        # 之后被 `normalize_capture` 静默丢掉，没有任何痕迹。没有这本账，
+        # "回调没触发" / "信号里没有 timings" / "时序含 0" / "太短" 四种情况长得完全一样。
+        self._learn_raw_events: int = 0
+        self._learn_dropped: dict[str, int] = {}
+        self._learn_last_raw: list = []
+        # 打开"请按遥控器"这一页时的接收器 state（时间戳）。提交后与"此刻"的 state
+        # 对比，就能自证"按的那一下到底有没有让 HA 收到帧" —— 单看一个时间戳证明不了
+        # 什么（那是**历史上最近一次**收到帧的时刻，可能是几分钟前那次成功的测试）。
+        self._receiver_state_at_start: str = ""
 
     # ------------------------------------------------------------------ 工具
 
@@ -751,10 +766,72 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @callback
     def _learn_on_signal(self, signal) -> None:
-        """接收回调（同步、必须极快）：把一帧原始时序规整后入缓冲。"""
-        capture = normalize_capture(getattr(signal, "timings", None))
-        if capture is not None:
-            self._learn_captures.append((capture, getattr(signal, "modulation", None)))
+        """接收回调（同步、必须极快）：把一帧原始时序规整后入缓冲，**并记账**。
+
+        ⚠️ 记账是必须的。帧到了这里若被 `normalize_capture` 丢掉，原实现不留任何痕迹，
+        界面上就只剩一句笼统的"没有捕获到红外信号"。于是下面这些**处置完全相反**的
+        故障长得一模一样，用户无从下手：
+
+          1. 回调压根没被调用 —— 选错接收器 / 遥控没对准 / 设备离线 / 订阅没接上
+          2. signal 没有 timings —— 不是红外信号，或 HA 的接收接口变了
+          3. 时序里含 0 —— 奇偶会错位，宁可不匹配也不给错码
+          4. 时序太短（< 8 段）—— 多半是接收侧把波形记坏了
+
+        1 要去查硬件与选型，2/3/4 要去查接收链路质量，所以必须分开报出来。
+        日志里同时留原始片段，是为了"配不上"时能直接把波形拿来做反向复现。
+        """
+        self._learn_raw_events += 1
+        timings = getattr(signal, "timings", None)
+        if not timings:
+            self._learn_bump("信号里没有 timings 字段")
+            return
+        if not self._learn_last_raw:
+            self._learn_last_raw = [
+                self._learn_to_int(value) for value in list(timings)[:24]
+            ]
+        capture = normalize_capture(timings)
+        if capture is None:
+            reason = self._classify_drop(timings)
+            self._learn_bump(reason)
+            _LOGGER.info(
+                "IR Hub learn: 丢弃一帧（%s）原始 %d 段：%s",
+                reason,
+                len(timings),
+                list(timings)[:24],
+            )
+            return
+        self._learn_captures.append((capture, getattr(signal, "modulation", None)))
+        _LOGGER.info(
+            "IR Hub learn: 接受一帧（%d 段，首脉冲 %d µs，全长 %d µs）",
+            *capture_features(capture),
+        )
+
+    def _learn_bump(self, reason: str) -> None:
+        """记一次丢弃。按原因分类计数 —— 原因不同，处置完全不同。"""
+        self._learn_dropped[reason] = self._learn_dropped.get(reason, 0) + 1
+
+    @staticmethod
+    def _learn_to_int(value) -> int | str:
+        """原始时序里的元素转 int；转不了就原样留字串（只为展示，不影响判定）。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    @classmethod
+    def _classify_drop(cls, timings) -> str:
+        """帧被丢弃的原因。判定顺序与 `learn_match.normalize_capture` 一一对应。"""
+        numbers: list[int] = []
+        for value in timings:
+            try:
+                numbers.append(int(value))
+            except (TypeError, ValueError):
+                return "时序里有非数字项"
+        if any(number == 0 for number in numbers):
+            return "时序里含 0（奇偶会错位）"
+        if len(numbers) < 8:
+            return f"太短（只有 {len(numbers)} 段，至少 8 段）"
+        return "时序不合法（未被接纳）"
 
     def _learn_start_capture(self) -> None:
         """清空缓冲并订阅所选接收器。
@@ -766,6 +843,13 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """
         self._learn_captures = []
         self._learn_subscribe_error = ""
+        # 重置回调侧账本，并记下「打开本页那一刻」的接收器 state。
+        # 提交时与"此刻"的 state 做**前后对比**，才能自证按的那一下有没有让 HA 收到帧 ——
+        # 单看一个时间戳什么都证明不了（那是历史上最近一次收到帧的时刻）。
+        self._learn_raw_events = 0
+        self._learn_dropped = {}
+        self._learn_last_raw = []
+        self._receiver_state_at_start = self._receiver_state_value()
         self._learn_stop_capture()
         try:
             self._learn_unsub = infrared.async_subscribe_receiver(
@@ -861,6 +945,17 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return "未选择"
         return self._receiver_options([entity_id])[entity_id]
 
+    def _receiver_state_value(self) -> str:
+        """接收器 state 的**原始值**（`unknown` / `unavailable` / ISO 时间戳）。
+
+        与 `_receiver_state()`（给人看的长句）分开：这里要的是可比对的裸值，
+        用于"打开本页时 vs 提交时"的前后对比。
+        """
+        if not self._receiver:
+            return ""
+        state = self.hass.states.get(self._receiver)
+        return str(state.state) if state is not None else ""
+
     def _receiver_state(self) -> str:
         """所选接收器的 state —— 判断"帧到底有没有进 HA"的探针。
 
@@ -931,7 +1026,9 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     step_id="learn_press",
                     data_schema=vol.Schema({}),
                     errors={"base": self._learn_capture_error()},
-                    description_placeholders=self._learn_press_placeholders("电源键", 1),
+                    description_placeholders=self._learn_press_placeholders(
+                        "电源键", 1, failed=True
+                    ),
                 )
             self._learn_stop_capture()
             self._learn_capture1 = best[0]
@@ -963,7 +1060,9 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     step_id="learn_press2",
                     data_schema=self._learn_action_schema(),
                     errors={"base": self._learn_capture_error()},
-                    description_placeholders=self._learn_press_placeholders(key_hint, 2),
+                    description_placeholders=self._learn_press_placeholders(
+                        key_hint, 2, failed=True
+                    ),
                 )
             self._learn_stop_capture()
             self._learn_capture2 = best[0]
@@ -1002,11 +1101,80 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return "receiver_unavailable"
         return "no_signal"
 
-    def _learn_press_placeholders(self, key_hint: str, seq: int) -> dict[str, str]:
+    def _learn_capture_diagnosis(self) -> str:
+        """"没信号"到底断在哪一环 —— 只有本集成能回答，不能让用户瞎猜。
+
+        三种断法的处置**完全不同**：
+
+        - 回调 0 次 + state 没变 → 帧没进 HA：选错接收器 / 没对准 / 设备离线
+        - 回调 0 次 + state 变了 → 帧进了 HA 但订阅没接上（接口层问题）
+        - 回调 ≥1 次但全被丢   → 帧进来了但不可用：接收侧把波形记坏了
+
+        只在**提交失败后重新显示表单**时挂出来（首次打开页面时用户还没按，
+        挂出来必然误报"帧没进 HA"）。
+        """
+        now = self._receiver_state_value()
+        now_display = now or "无实体"
+        state_changed = bool(now) and now != self._receiver_state_at_start
+
+        if self._learn_raw_events == 0:
+            if state_changed:
+                return (
+                    f"\n\n⚠️ **帧进了 HA，但本集成的接收回调一次都没被调用。**"
+                    f"接收器的 state 已从 `{self._receiver_state_at_start}` "
+                    f"前进到 `{now}`，说明那台设备确实收到了信号 —— 断在订阅上。"
+                    "请原样再按一次重试；仍然如此，把这一行连同上一次按键的时刻发出来。"
+                )
+            return (
+                f"\n\n❗ **帧根本没进 HA。** 接收回调一次都没被调用，接收器的 state 也"
+                f"没变（当前 `{now_display}`）。请确认遥控器对准的是下拉里选中的那一台"
+                f"（{self._receiver_label()}），并在 ESPHome 日志里搜 `remote.pronto` "
+                "或 `remote.raw`：**日志里没有，就是红外没打到这颗接收头上**"
+                "（距离太远 / 角度偏 / 接收头供电不足 / 遥控器电池弱），"
+                "**与码库无关** —— 重按多少次也配不上。"
+            )
+
+        dropped = sum(self._learn_dropped.values())
+        if self._learn_captures:
+            return (
+                f"\n\n✅ 回调被调用 {self._learn_raw_events} 次，其中 "
+                f"{len(self._learn_captures)} 帧可用（丢弃 {dropped} 帧）。"
+            )
+
+        reasons = "；".join(
+            f"{reason} × {count}" for reason, count in self._learn_dropped.items()
+        )
+        sample = ""
+        if self._learn_last_raw:
+            sample = (
+                "\n\n最近一帧的原始时序前 24 段（µs）：\n\n"
+                f"`{','.join(str(value) for value in self._learn_last_raw)}`"
+            )
+        return (
+            f"\n\n⚠️ **信号进来了，但一帧都没能规整出来。** 回调被调用 "
+            f"{self._learn_raw_events} 次，丢弃 {dropped} 帧。原因：{reasons}。\n\n"
+            "这**不是码库的问题**，是接收侧把波形记坏了。本机接收端是 ESP8266"
+            "（ESP-12F），它的 `remote_receiver` 走**软件计时**：`buffer_size` 固定"
+            " 1000 个脉冲、不会自动扩容（ESP32 的 RMT 会按需扩到两倍），"
+            "遇到长帧（空调状态帧、机顶盒长协议）会中途溢出重写，"
+            "表现就是元素数变少或首尾错位。\n\n"
+            "处置（按性价比排序）：① 换 ESP32 做**接收**端 —— RMT 硬件解码，最有效；"
+            "② 把 `remote_receiver` 的 `buffer_size` 调到 `2000b` 以上；"
+            "③ 长间隙的协议会被 `idle: 10ms` 切成两帧，可适当调大 `idle`。"
+            "改完重新配对。"
+            + sample
+        )
+
+    def _learn_press_placeholders(
+        self, key_hint: str, seq: int, *, failed: bool = False
+    ) -> dict[str, str]:
         """learn_press / learn_press2 的占位符。
 
-        `receiver_state` 与 `subscribe_error` 是**诊断字段**：它们把"0 帧"拆成
-        "帧没进 HA"（接收器选错/设备离线）和"进了 HA 但我们没解码"两种，用户自己就能分。
+        `receiver_state` / `subscribe_error` / `capture_diag` 是**诊断字段**：它们把
+        "0 帧"拆成"帧没进 HA"（接收器选错/设备离线）和"进了 HA 但没解码"两种，用户自己能分。
+
+        `failed=True` 表示这是**提交失败后重画的表单**（此时才挂 `capture_diag`；
+        首次打开页面时用户还没按遥控器，挂出来必然误报"帧没进 HA"）。
         """
         subscribe_error = (
             f"\n\n⚠️ **订阅接收器失败**：`{self._learn_subscribe_error}`"
@@ -1022,6 +1190,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "captured": str(len(self._learn_captures)),
             "receiver_state": self._receiver_state(),
             "subscribe_error": subscribe_error,
+            "capture_diag": self._learn_capture_diagnosis() if failed else "",
         }
 
     def _learn_capture_report(self) -> str:
@@ -1062,13 +1231,37 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return (
                 f"⚠️ 最高相似度 **{score:.2f}**（{keys}）：**偏低**。可能对、也可能是"
                 "同族近似型号 —— 发实测码试一下最直接；没反应就重新配对并按第 2 键。"
+                + self._learn_ac_survivor_note()
             )
         return (
-            f"❌ 最高相似度 **{score:.2f}**（{keys}）：**太低，基本可以断定这只遥控**"
-            "**不在码库里**（库里真值一般 ≥0.90）。下面列出的只是最近邻，"
-            "**不是匹配结果**，别指望它管用。请选「↩ 退回重按」重新配对（务必按"
-            "第 2 键）；确认遥控没按错、也对准了接收器之后还是这样，就改用"
-            "「手动选择码库」按品牌型号挑，或换用能自学习的方案。"
+            f"❌ 最高相似度 **{score:.2f}**（{keys}）：**太低**。下面列出的只是最近邻，"
+            "**不是匹配结果**，别指望它管用。请选「↩ 退回重按」重新配对（务必按第 2 键）。"
+            + self._learn_ac_survivor_note()
+            + "确认遥控没按错、也对准了接收器之后还是这样，就改用「手动选择码库」按品牌"
+            "型号挑，或换用能自学习的方案。"
+        )
+
+    def _learn_ac_survivor_note(self) -> str:
+        """空调专用：用"结构预筛幸存数"把「库外遥控」与「捕获被记坏」分开。
+
+        这两个原因在旧版界面上长得**完全一样**（都是一个很低的分），但解法相反：
+        前者只能改用手动选型号，后者要修接收链路。幸存数就是那个判别量 ——
+        它只问"这一帧的形状（帧长 ±3 段、引导码）库里有没有"。
+        """
+        if self._category != CATEGORY_AC or not self._learn_ac_survivors:
+            return ""
+        if self._learn_ac_survivors <= 3:
+            return (
+                f"\n\n诊断：空调库 **509 个型号里只有 {self._learn_ac_survivors} 个**的帧形状"
+                "与这一帧对得上（帧长只容差 ±3 段，引导码也得同量级），**其余全对不上**。"
+                "形状在库里几乎找不到对应的帧，**基本可以断定这只空调遥控不在码库里**，"
+                "重配对也救不回来。建议改走「手动选择码库」按品牌型号挑。"
+            )
+        return (
+            f"\n\n诊断：空调库里有 **{self._learn_ac_survivors} 个型号**的帧形状与这一帧"
+            "对得上，但**逐帧分数全都不够** —— 形状对、细节错。这通常是**捕获被接收端"
+            "记坏了**（抖动过大 / 帧被切掉一截），而不是库里没有。"
+            "请重按一次（按得干脆一点、离接收器近一些）再试，仍不行就换 ESP32 做接收端。"
         )
 
     def _learn_converge(self, scores1: dict, scores2: dict | None, what: str) -> list:
@@ -1133,10 +1326,16 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         self._learn_top_score = hits1[0]["score"] if hits1 else 0.0
         scores1 = _bin_scores(hits1)
-        # 候选数与最高分是判断"库里有/没有这只遥控"的唯一依据：
-        # 库里真值 → 十几个到几十个候选、最高 ~0.94；库外遥控 → 1~2 个、最高 ≤0.75。
+        # 分级诊断：结构预筛幸存数 = "这一帧的**形状**库里有对应吗"（帧长 ±3 段 + 引导码）；
+        # 最终候选数 = "形状对上的那些型号，逐帧分数够不够"。
+        # 前者 ≈1~2 ⇒ 库外遥控；前者正常而后者寥寥 ⇒ 捕获被接收端记坏了。两者解法相反，
+        # 所以必须分开报，不能只报一个低分让用户去猜。
+        self._learn_ac_survivors = await self.hass.async_add_executor_job(
+            structure_survivors, ac_library, capture1
+        )
         _LOGGER.info(
-            "IR Hub learn(AC): 候选 %d 个，top5 %s",
+            "IR Hub learn(AC): 结构预筛幸存 %d 个 bin → 打分后候选 %d 个，top5 %s",
+            self._learn_ac_survivors,
             len(hits1),
             [(hit["bin"], round(hit["score"], 3)) for hit in hits1[:5]],
         )
@@ -1205,6 +1404,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._learn_capture2 = None
         self._learn_used_two_keys = False
         self._learn_top_score = 0.0
+        self._learn_ac_survivors = 0
         return await self.async_step_learn_press()
 
     async def async_step_learn_pick(self, user_input: dict | None = None):
