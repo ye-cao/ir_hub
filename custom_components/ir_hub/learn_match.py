@@ -49,6 +49,30 @@ _ALIGNMENTS = (
 # 引导码门限：捕获里 ≥ 此值的正脉冲才算"引导码存在"（NEC 9ms / RCA 4ms 均过）
 _LEADER_US = 3000
 
+# 内部长 gap 阈值：帧内 > 此值的**负**元素 = 两个 burst 的边界。
+# 为什么需要它：`remote_receiver` 的 `Signal is done after 10000 us`（默认 10 ms）
+# 只按"静默"切帧，间隔 <10 ms 的**重复发送**会被合并成一整帧 —— 同一次按键可能
+# 捕成 200 段、也可能 300 段，而码库里存的是固定遍数。帧长预筛只容差 ±3 段，
+# 于是多合并一遍就**整库被灭**，症状与"库外遥控"一模一样（见 `burst_prefixes`）。
+_BURST_GAP_US = 3000
+# burst 前缀候选的最小段数：比这短的前缀没有意义，只会白算
+_MIN_VARIANT_LEN = 20
+
+# 「带 burst 前缀重试」的触发分：第一趟（原帧 / 丢首元素）的最高分低于此值，
+# 才补上 burst 前缀跑第二趟。
+# 为什么必须有这道门：前缀变体让大量"长度只有一半"的库帧也过帧长预筛，实测空调
+# 幸存 bin 从 27 抬到 59、单次匹配从 ~1.5 s 涨到 ~2.7 s（`verify_learn_ac` 的 8 s
+# 门禁直接撞破）。而**真匹配的第一趟分数本来就够高**，根本用不着第二趟。
+#
+# 取 0.85 是实测卡出来的（`tools/` 探针，2026-09-30）：
+#   - 空调抽样 120 例（±8% 抖动 + 10% 丢首元素）第一趟 top1：**119 例 ≥ 0.85**，
+#     只有 1 例落在 0.70~0.80 ⇒ 取 0.85 时重跑率 ≈1%，性能代价可以忽略；
+#   - 而**错帧的上界只有 0.765**（按键类合并帧：真帧不在候选里时，碰巧同长的
+#     错帧拿 0.765）、同长异帧 ≈0.79 ⇒ 门槛必须 > 0.80 才能拦住这类假冠军。
+# 一开始取 0.70 是错的：合并帧第一趟那个假冠军正好 0.765 ≥ 0.70，直接跳过了重试、
+# 把错帧当结果返回（selfcheck ⑤ 立刻抓到）。
+_PREFIX_RETRY_SCORE = 0.85
+
 # 帧签名量化步长（只用于把逐字节相同的库帧归成一组，20µs 足够细）
 _FRAME_BUCKET_US = 20
 
@@ -105,6 +129,71 @@ def capture_features(timings: list[int]) -> tuple[int, int, int]:
             break
     total = sum(abs(v) for v in timings)
     return len(timings), first, total
+
+
+def burst_prefixes(captured: list[int]) -> list[list[int]]:
+    """在**内部长 gap** 处把捕获截断，返回各个前缀（不含原帧本身）。
+
+    ⚠️ 这是"接收端把重复发送合并成一帧"的容错，不是常规对齐。
+    实测（2026-09-30，`irda_new_ac_25065` 家族，库帧 200 段、2 个 burst）：
+
+        原样 300 段 → 结构预筛幸存 2、最高分 0.632 → 判"不在码库"（**错的**）
+        截到 200 段 → 结构预筛幸存 27、最高分 0.866 → 命中真型号
+
+    把库帧拆成 100 段 burst 逐块比 bit，捕获的两块与库内
+    `('on','cool','auto',26)` / `('off',)` **逐位完全相同** —— 遥控器把状态帧
+    连发 N 遍，接收端按"静默 <10 ms 不切帧"把它们粘成了一帧。
+
+    从 index 2 开始扫：index 0/1 是引导码的 mark/space（引导 space 本身常 >3000µs，
+    不能当 burst 边界）；末尾那个长 gap 是 idle，`range` 到 n-1 为止天然排除。
+    """
+    out: list[list[int]] = []
+    n = len(captured)
+    for i in range(2, n - 1):
+        if captured[i] <= -_BURST_GAP_US and i + 1 >= _MIN_VARIANT_LEN:
+            out.append(captured[: i + 1])
+    return out
+
+
+def capture_candidates(
+    captured: list[int], include_prefixes: bool = False
+) -> list[list[int]]:
+    """预筛与打分共用的候选捕获：原帧 / 丢首元素（+ 可选 burst 前缀）。
+
+    「丢首元素」是原有行为（引导码被接收端丢掉时用）；「burst 前缀」是
+    "接收端把重复发送合并成一帧"的容错（见 `burst_prefixes`），**默认关闭** ——
+    把前缀塞进预筛会让大量"长度只有一半"的库帧也通过，实测空调单次匹配
+    从 ~1.5 s 涨到 ~3 s 并撞破 8 s 性能门禁，所以只在第一趟没找到像样候选时
+    才补上（见 `match_timings` 的两趟逻辑）。顺序即优先级：分数相同先出现者胜。
+    """
+    out: list[list[int]] = [captured]
+    if len(captured) > 9:
+        out.append(captured[1:])
+    if include_prefixes:
+        out.extend(burst_prefixes(captured))
+    return out
+
+
+def score_candidates(
+    candidates: list[list[int]],
+    cand_feats: list[tuple[int, int, int]],
+    lib_count: int,
+    lib_timings: list[int],
+) -> float:
+    """候选里**帧长对得上**的那些，各自打分取最高。
+
+    只对帧长对得上的候选打分：预筛已经把数量级不符的挡在外面了，
+    而 `_similarity` 对长度差很大的两帧本来就只会给低分（多余元素按满误差计），
+    逐个算纯属白费 —— 候选越多这一步的开销越可观。
+    """
+    best = 0.0
+    for (count, _first, _total), seq in zip(cand_feats, candidates):
+        if abs(lib_count - count) > _COUNT_TOLERANCE:
+            continue
+        value = _similarity(seq, lib_timings)
+        if value > best:
+            best = value
+    return best
 
 
 def frame_signature(timings: list[int]) -> tuple:
@@ -190,12 +279,15 @@ def _prefilter_pass(
     lib_first: int,
     lib_total: int,
 ) -> bool:
-    """双变体预筛：原样 / 丢首元素，任一变体过全部关卡即放行。
+    """多变体预筛：原帧 / 丢首元素 / 各 burst 前缀，任一变体过全部关卡即放行。
 
     ⚠️ 首脉宽是**条件门**：只有捕获里存在引导码级大脉冲（≥3000µs）才查比例 ——
     引导码被接收端丢掉后，首个正元素只是数据位脉宽（~560µs），拿它对库帧的
     9000 做比例检查必然错杀。引导码缺失时只靠 帧长 + 总时长 约束，
     对齐逻辑在打分侧兜底。
+
+    ⚠️ 变体里包含 **burst 前缀** 是为了"接收端把重复发送合并成一帧"（见
+    `burst_prefixes`）—— 不加这一档，合并过的捕获会被帧长这一关整库灭掉。
     """
     for count, first, total in cap_feats_variants:
         if abs(lib_count - count) > _COUNT_TOLERANCE:
@@ -212,25 +304,17 @@ def _prefilter_pass(
     return False
 
 
-def match_timings(
+def _match_pass(
     library,
     category: int,
     captured: list[int],
-    top_n: int | None = 8,
-    max_devices_per_frame: int = 6,
+    include_prefixes: bool,
+    top_n: int | None,
+    max_devices_per_frame: int,
 ) -> list[dict]:
-    """在大类内逐键比对，返回按**帧**分组的候选（按 score 降序）。
-
-    返回元素（一帧一项）：
-        {frame, score, n_devices, device_ids, devices: [
-            {device_id, brand, brand_name, model, key}, ... ≤ max_devices_per_frame
-        ]}
-    frame 是库帧（带符号 µs），可直接喂发射通道做试发确认。
-    top_n=None 时返回全部幸存帧（诊断 / "显示全部"用）。
-    """
-    cap_variants = [capture_features(captured)]
-    if len(captured) > 9:
-        cap_variants.append(capture_features(captured[1:]))
+    """一趟匹配：`include_prefixes` 决定要不要把 burst 前缀算进候选变体。"""
+    candidates = capture_candidates(captured, include_prefixes)
+    cap_variants = [capture_features(c) for c in candidates]
 
     features = _category_features(library, category)
 
@@ -258,7 +342,7 @@ def match_timings(
             if not timings:
                 continue
             _FRAME_CACHE[cache_key] = timings
-        score = _similarity(captured, timings)
+        score = score_candidates(candidates, cap_variants, len(timings), timings)
         if score < _SCORE_MIN:
             continue
         hits[sig_hash] = {
@@ -287,3 +371,40 @@ def match_timings(
 
     ranked = sorted(hits.values(), key=lambda item: -item["score"])
     return ranked if top_n is None else ranked[:top_n]
+
+
+def match_timings(
+    library,
+    category: int,
+    captured: list[int],
+    top_n: int | None = 8,
+    max_devices_per_frame: int = 6,
+) -> list[dict]:
+    """在大类内逐键比对，返回按**帧**分组的候选（按 score 降序）。
+
+    返回元素（一帧一项）：
+        {frame, score, n_devices, device_ids, devices: [
+            {device_id, brand, brand_name, model, key}, ... ≤ max_devices_per_frame
+        ]}
+    frame 是库帧（带符号 µs），可直接喂发射通道做试发确认。
+    top_n=None 时返回全部幸存帧（诊断 / "显示全部"用）。
+
+    **两趟**：第一趟只用「原帧 / 丢首元素」（= 老行为，零额外开销）；只有当捕获里
+    存在内部长 gap（`burst_prefixes` 非空 ⇒ 可能是被接收端合并过的重复发送）**且**
+    第一趟最高分低于 `_PREFIX_RETRY_SCORE` 时，才补上 burst 前缀重跑一趟，取两趟里
+    分数更高的那次。两趟的候选集是超集关系 ⇒ 第二趟只会更好、不会更差。
+    """
+    ranked = _match_pass(
+        library, category, captured, False, top_n, max_devices_per_frame
+    )
+    # 没有内部长 gap ⇒ 前缀为空、第二趟与第一趟完全等价，直接返回省一次全库预筛。
+    if not burst_prefixes(captured):
+        return ranked
+    if ranked and ranked[0]["score"] >= _PREFIX_RETRY_SCORE:
+        return ranked
+    retry = _match_pass(
+        library, category, captured, True, top_n, max_devices_per_frame
+    )
+    if retry and (not ranked or retry[0]["score"] > ranked[0]["score"]):
+        return retry
+    return ranked

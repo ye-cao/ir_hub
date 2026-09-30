@@ -321,6 +321,31 @@ def check_learn_match() -> None:
         f"match_timings：真帧全部排第 1（{matched}/{sampled}，电视机大类）",
     )
 
+    # ⑤ 接收端把**重复发送**合并成一帧时的容错（2026-09-30 定位的真实故障）。
+    #    `remote_receiver` 的 "Signal is done after 10000 us" 只按静默切帧，
+    #    间隔 <10 ms 的重复会被粘成一整帧 ⇒ 同一次按键可能 200 段也可能 300 段，
+    #    而码库存固定遍数。帧长预筛只容差 ±3 段，不加 burst 前缀就**整库被灭**，
+    #    症状与"库外遥控"一模一样（实测：300 段原样 → 0.632 判"不在库"；
+    #    截到 200 段 → 0.866 命中真型号，且两个 burst 块与库帧逐位相同）。
+    merged_frame = frame + frame[2:52]
+    prefixes = learn.burst_prefixes(merged_frame)
+    check(
+        frame in prefixes and all(len(p) >= learn._MIN_VARIANT_LEN for p in prefixes),
+        "burst_prefixes：能在合并帧的内部 gap 处截断出原帧（前缀不短于最小长度）",
+        f"前缀段数 {[len(p) for p in prefixes]}",
+    )
+    check(
+        learn.capture_candidates(merged_frame)[:2] == [merged_frame, merged_frame[1:]],
+        "capture_candidates：前两项仍是『原帧 / 丢首元素』（向后兼容，不掉旧档）",
+    )
+    merged_top = learn.match_timings(library, category, merged_frame, top_n=1)
+    check(
+        bool(merged_top)
+        and learn.frame_signature(merged_top[0]["frame"]) == learn.frame_signature(frame),
+        "match_timings：合并过重复块的捕获仍排第 1（未修时被帧长预筛整库灭掉）",
+        f"最高分 {merged_top[0]['score']:.3f}" if merged_top else "无候选",
+    )
+
 
 # ------------------------------------------------------ 3./4./5. 码库 / 不变式 / 统计
 def check_library() -> dict:
@@ -1913,6 +1938,19 @@ def check_config_flow() -> None:
             f"真值帧的『结构预筛幸存数』已记录且远离阈值（幸存 {saved_surv} 个 bin）",
             f"实际 _learn_ac_survivors={saved_surv}",
         )
+        # ⑫ 接收端把**重复发送**合并成一帧时的容错（空调路径）。
+        #    不修的话：捕获 300 段 vs 库帧 200 段，帧长预筛 ±3 把**整库灭掉**，
+        #    报出来是"幸存 ≤3 ⇒ 不在码库"，用户会以为型号不对 —— 而实测
+        #    两个 burst 块与库帧逐位相同，本来完全匹配得上。
+        ac_match_mod = sys.modules["_ir_hub_shim.learn_match_ac"]
+        merged_ac = ac_on1 + ac_on1[2:52]          # 末尾 idle 变成内部 gap，再接一段重复
+        merged_surv = ac_match_mod.structure_survivors(ac_lib, merged_ac)
+        merged_bins = [h["bin"] for h in ac_match_mod.match_ac(ac_lib, merged_ac, 8)]
+        check(
+            merged_surv > 3 and AC_BIN in merged_bins,
+            f"空调：合并过重复块的捕获仍命中真型号（{AC_BIN}，幸存 {merged_surv} 个 bin）",
+            f"实际候选 {merged_bins[:4]}",
+        )
         fl_ac._learn_top_score = 0.20
         fl_ac._learn_ac_survivors = 1
         verdict_gone = fl_ac._learn_verdict()
@@ -2736,7 +2774,7 @@ def main() -> int:
     #          共用码实测文案 / retry 退回候选 / ok 进 ac_test /
     #          entry 校验（共用码品牌留空）/ 跨品牌『自动试下一个』 /
     #          两键交集仍含真值）
-    expected_total = 255
+    expected_total = 259
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(
