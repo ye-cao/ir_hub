@@ -220,8 +220,24 @@ def check_manifests() -> None:
             set(
                 blob.get("options", {}).get("step", {}).get("init", {}).get("data", {})
             )
-            == {"carrier", "repeats", "tx_delay", "mqtt_format"},
-            f"{lang}: options 步 data 键 = carrier/repeats/tx_delay/mqtt_format",
+            == {
+                "carrier",
+                "repeats",
+                "tx_delay",
+                "tx_type",
+                "tx_target",
+                "mqtt_format",
+                "temperature_sensor",
+                "humidity_sensor",
+                "power_sensor",
+            },
+            f"{lang}: options 步 data 键 = 载波/次数/延迟/通道/目标/mqtt格式/温湿度功率传感器",
+        )
+        # options 的 error 键（发射目标校验失败时用户看到的不是原始英文键名）
+        check(
+            {"target_missing", "mqtt_missing"}
+            <= set(blob.get("options", {}).get("error", {})),
+            f"{lang}: options.error 覆盖 target_missing / mqtt_missing",
         )
         missing_error_keys += [
             f"{lang}.{key}"
@@ -639,6 +655,10 @@ def _install_ha_stubs() -> type:
         def async_write_ha_state(self) -> None:
             self.wrote_state = True
 
+        def async_on_remove(self, func) -> None:
+            # 真 HA 里是 Entity.async_on_remove：登记"实体移除时一并注销"的回调
+            self.__dict__.setdefault("_stub_on_remove", []).append(func)
+
         async def async_added_to_hass(self) -> None:
             pass
 
@@ -760,6 +780,22 @@ def _install_ha_stubs() -> type:
     ha_const.ATTR_TEMPERATURE = "temperature"
     # SmartAC 参照实现（re/smartac/controller.py 差分对拍用）
     ha_const.ATTR_ENTITY_ID = "entity_id"
+    # 可选传感器（climate 的功率/温湿度订阅用）
+    ha_const.STATE_ON = "on"
+    ha_const.STATE_OFF = "off"
+    ha_const.STATE_UNKNOWN = "unknown"
+    ha_const.STATE_UNAVAILABLE = "unavailable"
+
+    # climate 的传感器订阅：只记账，不真挂总线。测试里直接调回调（带
+    # `{"new_state": ..., "old_state": ...}` 的假 event）来驱动状态机。
+    event_mod = mod("homeassistant.helpers.event")
+
+    def _stub_track_state_change_event(hass, entity_ids, action):
+        event_mod._STUB_SUBS.append((tuple(entity_ids), action))
+        return lambda: None
+
+    event_mod._STUB_SUBS = []
+    event_mod.async_track_state_change_event = _stub_track_state_change_event
 
     # ServiceCall 只被 `__init__.py` 用作类型注解，名字存在即可（不会求值）。
     class ServiceCall:
@@ -788,6 +824,7 @@ def _install_ha_stubs() -> type:
     ha.helpers.device_registry, ha.helpers.entity_platform = device_registry, entity_platform
     ha.helpers.restore_state = restore_state
     ha.helpers.config_validation = config_validation
+    ha.helpers.event = event_mod
     return HomeAssistantError
 
 
@@ -2071,52 +2108,145 @@ def check_config_flow() -> None:
             "async_get_options_flow 返回 IrHubOptionsFlow",
         )
 
-        # ⑦ OptionsFlow
+        # ⑦ OptionsFlow（0.3.12 起含发射通道与可选传感器）
         options = flow_mod.IrHubOptionsFlow()
+        options.hass = FakeHass()
         options.config_entry = FakeEntry()
+        infrared.STUB_EMITTERS = [EMITTER]
         await options.async_step_init()
         check(options.shown["step_id"] == "init", "options 步 step_id = init")
         defaults = _schema_defaults(options.shown["data_schema"])
         check(
             defaults.get("carrier") == 38000
             and defaults.get("repeats") == 1
-            and defaults.get("tx_delay") == 0.5,
-            "options 表单默认值来自 entry（38000 / 1 / delay 0.5）",
+            and defaults.get("tx_delay") == 0.5
+            and defaults.get("tx_type") == "infrared",
+            "options 表单默认值来自 entry（38000 / 1 / delay 0.5 / infrared）",
             f"实际 {defaults!r}",
         )
         check(
-            options.shown["data_schema"](
-                {"carrier": "40000", "repeats": "3", "tx_delay": "1"}
-            )
-            == {"carrier": 40000, "repeats": 3, "tx_delay": 1.0},
+            _schema_options(options.shown["data_schema"], "tx_target")
+            == {EMITTER: None},
+            "options 的发射目标按通道出下拉（infrared -> emitter 实体）",
+        )
+        check(
+            _schema_defaults(options.shown["data_schema"]).get("temperature_sensor") == ""
+            and _schema_defaults(options.shown["data_schema"]).get("humidity_sensor") == ""
+            and _schema_defaults(options.shown["data_schema"]).get("power_sensor") == "",
+            "可选传感器三个字段默认空（留空 = 不用）",
+        )
+        _full = {
+            "carrier": 38000, "repeats": 1, "tx_delay": 0.5,
+            "tx_type": "infrared", "tx_target": EMITTER,
+        }
+        validated = options.shown["data_schema"](
+            {**_full, "carrier": "40000", "repeats": "3", "tx_delay": "1"}
+        )
+        check(
+            validated["carrier"] == 40000 and validated["repeats"] == 3
+            and validated["tx_delay"] == 1.0,
             "options 对输入做 Coerce（字符串 -> int/float）",
         )
+        # 保存：tx 字段 + 传感器一起写进 options（HA 会自动 reload 条目）
         options = flow_mod.IrHubOptionsFlow()
+        options.hass = FakeHass()
         options.config_entry = FakeEntry()
-        await options.async_step_init({"carrier": 56000, "repeats": 2, "tx_delay": 1.5})
+        await options.async_step_init({
+            **_full, "carrier": 56000, "repeats": 2, "tx_delay": 1.5,
+            "temperature_sensor": "sensor.room_temp",
+            "humidity_sensor": "sensor.room_hum",
+            "power_sensor": "switch.ac_plug",
+        })
         check(
-            options.created["data"] == {"carrier": 56000, "repeats": 2, "tx_delay": 1.5},
-            "options 保存 carrier/repeats/tx_delay（改完自动 reload）",
+            options.created["data"] == {
+                "carrier": 56000, "repeats": 2, "tx_delay": 1.5,
+                "tx_type": "infrared", "tx_target": EMITTER,
+                "mqtt_format": "smartac",
+                "temperature_sensor": "sensor.room_temp",
+                "humidity_sensor": "sensor.room_hum",
+                "power_sensor": "switch.ac_plug",
+            },
+            "options 保存载波/次数/延迟/通道/目标/传感器（改完自动 reload）",
+            f"实际 {options.created!r}",
+        )
+        # 目标失效（emitter 被删）-> 表单能打开（旧值留在下拉里），提交被拦下并给报错
+        infrared.STUB_EMITTERS = ["infrared.another"]
+        options = flow_mod.IrHubOptionsFlow()
+        options.hass = FakeHass()
+        options.config_entry = FakeEntry()
+        await options.async_step_init()
+        check(
+            EMITTER in _schema_options(options.shown["data_schema"], "tx_target"),
+            "存的旧 emitter 已不在列表 -> 仍留在下拉里（表单不能打不开）",
+        )
+        await options.async_step_init({**_full, "tx_target": EMITTER})
+        check(
+            options.created is None
+            and options.shown.get("errors") == {"base": "target_missing"},
+            "旧 emitter 已失效 -> 提交被拦下并报 target_missing",
+            f"实际 created={options.created!r} errors={options.shown.get('errors')!r}",
+        )
+        infrared.STUB_EMITTERS = [EMITTER]
+        # 换发射通道：通道变了 -> 目标字段按新通道重画（mqtt 是自由文本），不丢已填值
+        options = flow_mod.IrHubOptionsFlow()
+        options.hass = FakeHass()
+        options.config_entry = FakeEntry()
+        await options.async_step_init()
+        await options.async_step_init({
+            **_full, "carrier": 40000, "tx_type": "mqtt", "tx_target": "tcl_ir/ir_send",
+        })
+        check(
+            options.created is None and options.shown["step_id"] == "init",
+            "切换通道类型 -> 重画表单（不直接保存）",
+            f"实际 created={options.created!r}",
+        )
+        check(
+            _schema_options(options.shown["data_schema"], "tx_target") is None
+            and _schema_defaults(options.shown["data_schema"]).get("tx_target")
+            == "tcl_ir/ir_send"
+            and _schema_defaults(options.shown["data_schema"]).get("carrier") == 40000,
+            "重画后 mqtt 的目标是自由文本、用户已填的 topic 与载波保留",
+            f"实际 defaults={_schema_defaults(options.shown['data_schema'])!r}",
+        )
+        # mqtt 通道保存（需要 mqtt.publish 服务在场才会过校验）
+        options.hass.services._have.add(("mqtt", "publish"))
+        await options.async_step_init({
+            **_full, "carrier": 40000, "tx_type": "mqtt", "tx_target": "tcl_ir/ir_send",
+            "mqtt_format": "tasmota",
+        })
+        check(
+            options.created is not None
+            and options.created["data"]["tx_type"] == "mqtt"
+            and options.created["data"]["tx_target"] == "tcl_ir/ir_send"
+            and options.created["data"]["mqtt_format"] == "tasmota",
+            "options 换成 mqtt 通道保存（含 mqtt_format）",
+            f"实际 created={options.created!r}",
         )
 
         # ⑧ mqtt 通道的 OptionsFlow 才出现 mqtt_format 字段（默认 smartac）
         class FakeMqttEntry(FakeEntry):
-            data = {**FakeEntry.data, "tx_type": "mqtt"}
+            data = {**FakeEntry.data, "tx_type": "mqtt", "tx_target": "tcl_ir/ir_send"}
 
         options = flow_mod.IrHubOptionsFlow()
+        options.hass = FakeHass()
         options.config_entry = FakeMqttEntry()
         await options.async_step_init()
         mdefaults = _schema_defaults(options.shown["data_schema"])
         check(
-            mdefaults.get("mqtt_format") == "smartac",
+            mdefaults.get("mqtt_format") == "smartac"
+            and mdefaults.get("tx_type") == "mqtt",
             "mqtt 条目的 options 出现 mqtt_format（默认 smartac）",
             f"实际 {mdefaults!r}",
         )
         options = flow_mod.IrHubOptionsFlow()
+        options.hass = FakeHass()
         options.config_entry = FakeMqttEntry()
-        await options.async_step_init(
-            {"carrier": 40000, "repeats": 2, "tx_delay": 1.0, "mqtt_format": "tasmota"}
-        )
+        # mqtt 通道校验要求 mqtt.publish 服务在场
+        options.hass.services._have.add(("mqtt", "publish"))
+        await options.async_step_init({
+            **_full, "tx_type": "mqtt", "tx_target": "tcl_ir/ir_send",
+            "carrier": 40000, "repeats": 2, "tx_delay": 1.0, "mqtt_format": "tasmota",
+        })
         check(
             options.created["data"].get("mqtt_format") == "tasmota",
             "options 保存 mqtt_format=tasmota",
@@ -2541,11 +2671,26 @@ def check_ac() -> None:
 
     import types as _types
 
+    class FakeStates:
+        """极简状态注册表：`hass.states.get()` / `set()`，传感器用例够用。"""
+
+        def __init__(self) -> None:
+            self._s: dict = {}
+
+        def set(self, entity_id: str, state: str) -> None:
+            self._s[entity_id] = _types.SimpleNamespace(
+                entity_id=entity_id, state=state
+            )
+
+        def get(self, entity_id: str):
+            return self._s.get(entity_id)
+
     FakeHass = _types.SimpleNamespace(
         config=_types.SimpleNamespace(
             units=_types.SimpleNamespace(temperature_unit="°C")
         ),
         data={},
+        states=FakeStates(),
     )
 
     class FakeEntry:
@@ -2560,10 +2705,9 @@ def check_ac() -> None:
             "repeats": 1,
         }
 
-    def build():
-        entity = climate_mod.IrHubClimate(
-            FakeHass, FakeEntry(), dict(FakeEntry.data), dict(code)
-        )
+    def build(extra_data: dict | None = None):
+        data = {**FakeEntry.data, **(extra_data or {})}
+        entity = climate_mod.IrHubClimate(FakeHass, FakeEntry(), dict(data), dict(code))
         entity.hass = FakeHass
         entity.sent = []
         entity.wrote_state = False
@@ -2728,6 +2872,109 @@ def check_ac() -> None:
             and entity._attr_target_temperature == 25.0
             and entity._last_on_operation == HVACMode.HEAT,
             "RestoreEntity：模式/风速/温度/last_on_operation 全恢复",
+        )
+
+        # ---- 可选传感器（0.3.12，对齐 SmartAC）----
+        # 配了温湿度/功率传感器 -> async_added_to_hass 挂 3 个订阅
+        event_mod = sys.modules["homeassistant.helpers.event"]
+        event_mod._STUB_SUBS.clear()
+        entity = build({
+            "temperature_sensor": "sensor.room_temp",
+            "humidity_sensor": "sensor.room_hum",
+            "power_sensor": "switch.ac_plug",
+        })
+        await entity.async_added_to_hass()
+        check(
+            len(event_mod._STUB_SUBS) == 3,
+            "配了温湿度/功率传感器 -> async_added_to_hass 挂 3 个订阅",
+            f"实际 {len(event_mod._STUB_SUBS)} 个",
+        )
+        check(
+            entity.current_temperature is None and entity.current_humidity is None,
+            "传感器还没上报 -> current_temperature / humidity 为 None（不伪造）",
+        )
+        # 无历史状态也要挂上订阅（旧实现 last is None 直接 return，传感器永远挂不上）
+        entity = build({"power_sensor": "switch.ac_plug"})
+        event_mod._STUB_SUBS.clear()
+        await entity.async_added_to_hass()
+        check(
+            len(event_mod._STUB_SUBS) == 1
+            and event_mod._STUB_SUBS[0][0] == ("switch.ac_plug",),
+            "无历史状态（last None）时订阅照样挂上（旧实现会整段跳过）",
+        )
+        # 温度/湿度：事件驱动 + 初始值读一次
+        entity = build({
+            "temperature_sensor": "sensor.room_temp",
+            "humidity_sensor": "sensor.room_hum",
+        })
+        FakeHass.states.set("sensor.room_temp", "27.5")
+        FakeHass.states.set("sensor.room_hum", "61")
+        await entity.async_added_to_hass()
+        check(
+            entity.current_temperature == 27.5 and entity.current_humidity == 61.0,
+            "added_to_hass 时读一次传感器现值（27.5°C / 61%）",
+        )
+        FakeHass.states.set("sensor.room_temp", "unknown")
+        await entity._async_temp_sensor_changed_event(
+            _types.SimpleNamespace(
+                data={"new_state": FakeHass.states.get("sensor.room_temp")}
+            )
+        )
+        FakeHass.states.set("sensor.room_temp", "26.0")
+        await entity._async_temp_sensor_changed_event(
+            _types.SimpleNamespace(
+                data={"new_state": FakeHass.states.get("sensor.room_temp")}
+            )
+        )
+        check(
+            entity.current_temperature == 26.0,
+            "温度事件 unknown 跳过、26.0 生效（读不懂的值不覆盖旧值）",
+        )
+        # 功率传感器：ON 且当前关机 -> 同步成开机状态、不发红外
+        entity = build({"power_sensor": "switch.ac_plug"})
+        await entity.async_added_to_hass()
+        entity._last_on_operation = HVACMode.HEAT
+        await entity._async_power_sensor_changed_event(
+            _types.SimpleNamespace(data={
+                "new_state": _types.SimpleNamespace(entity_id="switch.ac_plug", state="on"),
+                "old_state": _types.SimpleNamespace(entity_id="switch.ac_plug", state="off"),
+            })
+        )
+        check(
+            entity._attr_hvac_mode == HVACMode.HEAT
+            and entity._on_by_remote
+            and len(entity.sent) == 0,
+            "功率 ON 且当前关机 -> 同步成上次开的模式（不发红外）",
+        )
+        # 同状态事件（on -> on）-> 忽略
+        await entity._async_power_sensor_changed_event(
+            _types.SimpleNamespace(data={
+                "new_state": _types.SimpleNamespace(entity_id="switch.ac_plug", state="on"),
+                "old_state": _types.SimpleNamespace(entity_id="switch.ac_plug", state="on"),
+            })
+        )
+        check(
+            entity._attr_hvac_mode == HVACMode.HEAT and len(entity.sent) == 0,
+            "功率 on -> on（状态没变）-> 忽略",
+        )
+        # OFF -> 关机
+        await entity._async_power_sensor_changed_event(
+            _types.SimpleNamespace(data={
+                "new_state": _types.SimpleNamespace(entity_id="switch.ac_plug", state="off"),
+                "old_state": _types.SimpleNamespace(entity_id="switch.ac_plug", state="on"),
+            })
+        )
+        check(
+            entity._attr_hvac_mode == HVACMode.OFF and not entity._on_by_remote,
+            "功率 OFF -> 面板同步成关机",
+        )
+        # 没配传感器 -> 完全无订阅（零开销）
+        event_mod._STUB_SUBS.clear()
+        entity = build()
+        await entity.async_added_to_hass()
+        check(
+            len(event_mod._STUB_SUBS) == 0,
+            "没配传感器 -> 不挂任何订阅",
         )
 
     asyncio.run(run())
@@ -2977,7 +3224,18 @@ def main() -> int:
     #           并真的发出 / fan_only+30°C 照样发 / cool+35°C 收敛到 30 /
     #           切模式收敛风速 / set_swing_mode 的帧与 off 档不同 /
     #           无摆风的型号不声明 SWING_MODE                            +11
-    expected_total = 278
+    #      + 0.3.12 SmartAC 移植 18 项（本段新增）：
+    #        ① 翻译 2 项（每语言 options init data 9 键 + options.error 覆盖
+    #           target_missing/mqtt_missing —— 按语言循环展开）
+    #        ② options flow 7 项（下拉按通道出 / 传感器默认空 / Coerce /
+    #           完整保存 tx+传感器 / 旧 emitter 留在下拉 / 失效目标提交被拦 /
+    #           换通道重画且保留已填值 + mqtt 保存 = ⑦⑧ 重写后共 13 项，
+    #           旧 6 项 => 净 +7）
+    #        ③ climate 传感器 9 项（配传感器挂 3 订阅 / 无传感器上报时不伪造
+    #           current_* / 无历史状态也挂订阅 / added 时读现值 / unknown 跳过
+    #           26.0 生效 / 功率 ON 同步开机且不发红外 / on->on 忽略 /
+    #           功率 OFF 同步关机 / 没配传感器零订阅）
+    expected_total = 296
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(

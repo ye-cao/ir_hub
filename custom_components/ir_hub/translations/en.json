@@ -128,14 +128,23 @@
     "step": {
       "init": {
         "title": "IR Hub settings",
-        "description": "Settings for {title}.\n\nCarrier: most devices use 38000 Hz. Do NOT trust the protocol name in the library — if the device ignores the codes, try 56000 (or 40000) here.\nTransmit count: how many times the frame is sent per press (1 = once). RAISE this if the device only responds every other press.\nBroadlink delay: only used by the Broadlink channel (seconds between sends).\nMQTT payload format: MQTT channel only. smartac = bare timing array (tcl-ir style bridges, default); tasmota = Tasmota IRMQTTServer RAW JSON.",
+        "description": "Settings for {title}.\n\nCarrier: most devices use 38000 Hz. Do NOT trust the protocol name in the library — if the device ignores the codes, try 56000 (or 40000) here.\nTransmit count: how many times the frame is sent per press (1 = once). RAISE this if the device only responds every other press.\nBroadlink delay: only used by the Broadlink channel (seconds between sends).\nMQTT payload format: MQTT channel only. smartac = bare timing array (tcl-ir style bridges, default); tasmota = Tasmota IRMQTTServer RAW JSON.\n\n**Transmit channel**: switchable right here (infrared / Broadlink / ESPHome / MQTT) — no need to delete and re-add the integration, and no re-pairing.\nTarget: infrared / Broadlink use an entity dropdown; ESPHome / MQTT are free text ({tx_target_hint}).\n\nOptional sensors (leave empty = unused): temperature / humidity are DISPLAY-only on the thermostat card; power = a smart plug on the AC, ON/OFF syncs \"the physical remote turned it on / off\" (on/off only, no wattage threshold).",
         "data": {
           "carrier": "Carrier frequency (Hz)",
           "repeats": "Transmit count",
           "tx_delay": "Broadlink delay (seconds)",
-          "mqtt_format": "MQTT payload format"
+          "tx_type": "Transmit channel",
+          "tx_target": "Transmit target (entity / service / topic)",
+          "mqtt_format": "MQTT payload format",
+          "temperature_sensor": "Room temperature sensor (optional)",
+          "humidity_sensor": "Humidity sensor (optional)",
+          "power_sensor": "Power sensor (optional)"
         }
       }
+    },
+    "error": {
+      "target_missing": "The transmit target is currently unavailable (entity missing / service not found / empty topic). Pick another one or check the spelling.",
+      "mqtt_missing": "The MQTT integration is not set up, so the MQTT channel cannot be used."
     }
   }
 }

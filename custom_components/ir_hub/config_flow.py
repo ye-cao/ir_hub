@@ -33,8 +33,11 @@ from .const import (
     CONF_CATEGORY,
     CONF_DEVICE,
     CONF_EMITTER,
+    CONF_HUMIDITY_SENSOR,
     CONF_MQTT_FORMAT,
+    CONF_POWER_SENSOR,
     CONF_REPEATS,
+    CONF_TEMPERATURE_SENSOR,
     CONF_TX_DELAY,
     CONF_TX_TARGET,
     CONF_TX_TYPE,
@@ -1512,38 +1515,155 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class IrHubOptionsFlow(config_entries.OptionsFlow):
-    """载波频率、发送次数、Broadlink delay —— 真正需要调的旋钮。"""
+    """选项：载波 / 发送次数 / delay / MQTT 格式 / **发射通道** / 可选传感器。
+
+    0.3.12 起：
+      · 发射通道（tx_type + tx_target）在这里**可以直接换** —— 不用删了重加集成、
+        更不用重新配对。保存后 HA 重载条目，实体按新通道重建。
+      · 新增可选传感器（对齐 SmartAC）：温度 / 湿度只做显示；功率（智能插座）
+        ON/OFF 用来同步"物理遥控器开了/关了空调"。
+    """
+
+    def __init__(self) -> None:
+        # 表单当前按哪个通道画的。HA 的流程表单是静态的：用户把通道从 infrared
+        # 换成 mqtt 时，目标字段的形态（下拉/文本）必须跟着换 —— 只能"重画一次"。
+        # 重画状态必须记在流程实例上：entry.data 里的通道在保存前不会变，
+        # 每次都从 entry 推会把第二次提交又当成"换通道"。
+        self._render_tx_type: str | None = None
 
     async def async_step_init(self, user_input: dict | None = None):
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
         entry = self.config_entry
         current = {**entry.data, **entry.options}
+        # 旧条目（0.3.0 前）只有 emitter 没有 tx_target —— 按实体的同款回退补上，
+        # 否则选项表单打开时目标是空的，用户会以为配置丢了。
+        if not current.get(CONF_TX_TARGET) and current.get(CONF_EMITTER):
+            current[CONF_TX_TARGET] = current[CONF_EMITTER]
+        render_type = self._render_tx_type or (
+            current.get(CONF_TX_TYPE) or TX_INFRARED
+        )
 
+        if user_input is not None:
+            tx_type = user_input[CONF_TX_TYPE]
+            if tx_type != render_type:
+                # 通道类型变了：目标字段必须按新通道重建（infrared / broadlink
+                # 是下拉、esphome / mqtt 是文本）。用新类型重画一次，用户已填的
+                # 其它值原样保留为默认值。
+                self._render_tx_type = tx_type
+                return self._async_show_options_form(
+                    current, tx_type=tx_type, defaults=user_input
+                )
+            tx_target = str(user_input.get(CONF_TX_TARGET) or "").strip()
+            error = await async_validate_target(self.hass, tx_type, tx_target)
+            if error is not None:
+                return self._async_show_options_form(
+                    current,
+                    tx_type=tx_type,
+                    defaults=user_input,
+                    errors={"base": error},
+                )
+            return self.async_create_entry(
+                title="",
+                data={
+                    CONF_CARRIER: user_input[CONF_CARRIER],
+                    CONF_REPEATS: user_input[CONF_REPEATS],
+                    CONF_TX_DELAY: user_input[CONF_TX_DELAY],
+                    CONF_TX_TYPE: tx_type,
+                    CONF_TX_TARGET: tx_target,
+                    CONF_MQTT_FORMAT: (
+                        user_input.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT
+                    ),
+                    CONF_TEMPERATURE_SENSOR: (
+                        str(user_input.get(CONF_TEMPERATURE_SENSOR) or "").strip()
+                    ),
+                    CONF_HUMIDITY_SENSOR: (
+                        str(user_input.get(CONF_HUMIDITY_SENSOR) or "").strip()
+                    ),
+                    CONF_POWER_SENSOR: (
+                        str(user_input.get(CONF_POWER_SENSOR) or "").strip()
+                    ),
+                },
+            )
+
+        self._render_tx_type = render_type
+        return self._async_show_options_form(current, tx_type=render_type)
+
+    def _async_show_options_form(
+        self,
+        current: dict,
+        tx_type: str,
+        defaults: dict | None = None,
+        errors: dict | None = None,
+    ):
+        """画选项表单。`defaults` 是上一把提交里用户已填的值（换通道重画时保留）。"""
+        values = {**current, **(defaults or {})}
         schema = {
             vol.Required(
                 CONF_CARRIER,
-                default=int(current.get(CONF_CARRIER) or DEFAULT_CARRIER),
+                default=int(values.get(CONF_CARRIER) or DEFAULT_CARRIER),
             ): vol.All(vol.Coerce(int), vol.Range(min=20000, max=60000)),
             vol.Required(
                 CONF_REPEATS,
-                default=int(current.get(CONF_REPEATS) or DEFAULT_REPEATS),
+                default=int(values.get(CONF_REPEATS) or DEFAULT_REPEATS),
             ): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
             vol.Required(
                 CONF_TX_DELAY,
-                default=float(current.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY),
+                default=float(values.get(CONF_TX_DELAY) or DEFAULT_TX_DELAY),
             ): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
+            # 发射通道：换通道不必删了重加 —— 目标字段的形态随通道变（见下）
+            vol.Required(CONF_TX_TYPE, default=tx_type): vol.In(TX_TYPE_OPTIONS),
+            vol.Required(
+                CONF_TX_TARGET,
+                default=str(values.get(CONF_TX_TARGET) or ""),
+            ): self._tx_target_validator(tx_type, str(values.get(CONF_TX_TARGET) or "")),
+            # 可选传感器：留空 = 不用。手填实体 id（对齐 SmartAC 的自由文本 ——
+            # 模板传感器可能还没建出来，下拉反而会卡住人）
+            vol.Optional(
+                CONF_TEMPERATURE_SENSOR,
+                default=str(values.get(CONF_TEMPERATURE_SENSOR) or ""),
+            ): str,
+            vol.Optional(
+                CONF_HUMIDITY_SENSOR,
+                default=str(values.get(CONF_HUMIDITY_SENSOR) or ""),
+            ): str,
+            vol.Optional(
+                CONF_POWER_SENSOR,
+                default=str(values.get(CONF_POWER_SENSOR) or ""),
+            ): str,
         }
         # MQTT 载荷格式只有 mqtt 通道有意义（smartac 裸数组 / tasmota RAW JSON）
-        if (current.get(CONF_TX_TYPE) or TX_INFRARED) == TX_MQTT:
+        if tx_type == TX_MQTT:
             schema[vol.Required(
                 CONF_MQTT_FORMAT,
-                default=current.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT,
+                default=values.get(CONF_MQTT_FORMAT) or DEFAULT_MQTT_FORMAT,
             )] = vol.In(MQTT_FORMATS)
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(schema),
-            description_placeholders={"title": entry.title},
+            errors=errors,
+            description_placeholders={
+                "title": self.config_entry.title,
+                "tx_type": dict(TX_TYPE_OPTIONS).get(tx_type, tx_type),
+                "tx_target_hint": _TX_TARGET_LABELS.get(tx_type, ""),
+            },
         )
+
+    def _tx_target_validator(self, tx_type: str, current_target: str):
+        """按通道生成目标字段的校验器（与 config flow 的 tx 步同款）。
+
+        ⚠️ 当前**存的旧值**必须留在下拉选项里 —— 发射器实体被删/改名后，
+        选项表单不能因此打不开；真失效会在提交时被 `async_validate_target`
+        拦下并给出明确报错。
+        """
+        if tx_type == TX_INFRARED:
+            choices = list(infrared.async_get_emitters(self.hass))
+        elif tx_type == TX_BROADLINK:
+            choices = sorted(
+                state.entity_id for state in self.hass.states.async_all("remote")
+            )
+        else:
+            # esphome / mqtt：自由文本
+            return str
+        if current_target and current_target not in choices:
+            choices.insert(0, current_target)
+        return vol.In(choices)

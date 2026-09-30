@@ -44,6 +44,16 @@ TX_TYPES = (TX_INFRARED, TX_ESPHOME, TX_BROADLINK, TX_MQTT)
 # Broadlink `remote.send_command` 的 delay_secs（沿用 SmartAC 默认值）
 DEFAULT_TX_DELAY = 0.5
 
+# ------------------------------------------------------------------ 可选传感器
+# 对齐 SmartAC（port 自 re/smartac）：红外是单向的拿不到回读，这三个是**可选**的
+# 外部传感器实体 id，选项里填（留空 = 不用）：
+#   · 温度 / 湿度 —— 只是**显示**在恒温器卡片上（current_temperature / humidity）；
+#   · 功率 —— 接空调的智能插座：ON ⇒ 物理遥控器把它开了（同步成开机状态），
+#     OFF ⇒ 关了。判断口径与 SmartAC 一致：只看 ON/OFF，不看瓦数阈值。
+CONF_TEMPERATURE_SENSOR = "temperature_sensor"
+CONF_HUMIDITY_SENSOR = "humidity_sensor"
+CONF_POWER_SENSOR = "power_sensor"
+
 # MQTT 载荷格式。
 # 默认 smartac：json.dumps([全正 µs 数组])。本机 tcl-ir 桥接固件就是这么解析的，
 # 发 Tasmota JSON 格式设备无反应。Tasmota IRMQTTServer 固件用户在选项里切 tasmota。

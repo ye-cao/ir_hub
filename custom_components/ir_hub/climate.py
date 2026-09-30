@@ -15,7 +15,11 @@
   · **取帧永不因"组合不存在"失败**：一律走 `ac_library.frame_for()`，不支持的分量
     按该模式/风速的能力替换并记日志。只有"整个模式×风速下一帧都没有"才报错。
   · `RestoreEntity`：重启后恢复模式/风速/温度/摆风。物理遥控器改的状态看不到
-    （红外单向，没有状态回读）。
+    （红外单向，没有状态回读）—— 例外见下一条。
+  · **可选外部传感器**（对齐 SmartAC，选项里填实体 id，留空不用）：
+    温度 / 湿度只用于**显示**室温湿度；功率（智能插座）传感器 ON/OFF 用来同步
+    "物理遥控器把它开了 / 关了" —— 功率 ON 且当前关机 ⇒ 状态改成开机（默认回到
+    上次开的模式），**不发红外**（红外侧其实什么都没做）；OFF ⇒ 状态改成关机。
   · off 有专用帧（`commands["off"]`）；开机/调温/调风/摆风共用"状态帧"。
 """
 
@@ -31,11 +35,18 @@ from homeassistant.components.climate import (
 )
 from homeassistant.components.infrared import InfraredEmitterConsumerEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .ac_library import AcLibrary, frame_for
@@ -45,8 +56,11 @@ from .const import (
     CONF_CATEGORY,
     CONF_DEVICE,
     CONF_EMITTER,
+    CONF_HUMIDITY_SENSOR,
     CONF_MQTT_FORMAT,
+    CONF_POWER_SENSOR,
     CONF_REPEATS,
+    CONF_TEMPERATURE_SENSOR,
     CONF_TX_DELAY,
     CONF_TX_TARGET,
     CONF_TX_TYPE,
@@ -124,6 +138,16 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         self._infrared_emitter_entity_id: str = self._tx_target
         self._carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
         self._repeats = max(1, int(data.get(CONF_REPEATS) or DEFAULT_REPEATS))
+
+        # ---- 可选外部传感器（对齐 SmartAC；留空 = 不用）----
+        # 温度/湿度只管显示；功率 ON/OFF 用来同步"物理遥控器开了/关了"。
+        self._temperature_sensor: str = data.get(CONF_TEMPERATURE_SENSOR) or ""
+        self._humidity_sensor: str = data.get(CONF_HUMIDITY_SENSOR) or ""
+        self._power_sensor: str = data.get(CONF_POWER_SENSOR) or ""
+        self._current_temperature: float | None = None
+        self._current_humidity: float | None = None
+        # 功率传感器判定出的"被遥控器开了"标记（与 SmartAC 同名状态对齐）。
+        self._on_by_remote = False
 
         # ---- 按模式的能力表（见 ac_library.decode_bin）----
         # 为什么不能只用 code["fan_modes"] / min_temp / max_temp：那三个是**全模式并集**。
@@ -232,35 +256,73 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ 恢复
 
     async def async_added_to_hass(self) -> None:
-        """infrared 通道先跟随 emitter 可用性，然后恢复上次状态。
+        """infrared 通道先跟随 emitter 可用性，然后恢复上次状态、挂传感器订阅。
 
         ⚠️ RestoreEntity 的恢复走 `async_get_last_state()` 直接调用（不经过
         super() 链）⇒ 非 infrared 通道跳过 super() 不会跳过恢复。
+        ⚠️ 订阅必须在"没有历史状态"时也执行 —— 旧实现 `last is None` 直接 return，
+        传感器就永远不会挂上。
         """
         if self._tx_type == TX_INFRARED:
             await super().async_added_to_hass()
         last = await self.async_get_last_state()
-        if last is None:
-            return
-        if last.state in {mode.value for mode in HVACMode}:
-            self._attr_hvac_mode = HVACMode(last.state)
-            if last.state != HVACMode.OFF.value:
-                self._last_on_operation = HVACMode(last.state)
-        if (fan := last.attributes.get("fan_mode")) in self._fans_of(self._active_mode):
-            self._attr_fan_mode = fan
-        if (swing := last.attributes.get("swing_mode")) in self._swing_modes:
-            self._attr_swing_mode = swing
-        if (temp := last.attributes.get("temperature")) is not None:
-            try:
-                value = float(temp)
-                if self._code["min_temp"] <= value <= self._code["max_temp"]:
-                    self._attr_target_temperature = value
-            except (TypeError, ValueError):
-                pass
-        # 恢复出来的组合可能不属于当前模式（码库换过/固件升级）—— 收敛一次
-        notes = self._normalize_for_mode(self._active_mode)
-        if notes:
-            _LOGGER.info("IR Hub: 恢复状态时按当前模式调整：%s", "；".join(notes))
+        if last is not None:
+            if last.state in {mode.value for mode in HVACMode}:
+                self._attr_hvac_mode = HVACMode(last.state)
+                if last.state != HVACMode.OFF.value:
+                    self._last_on_operation = HVACMode(last.state)
+            if (fan := last.attributes.get("fan_mode")) in self._fans_of(
+                self._active_mode
+            ):
+                self._attr_fan_mode = fan
+            if (swing := last.attributes.get("swing_mode")) in self._swing_modes:
+                self._attr_swing_mode = swing
+            if (temp := last.attributes.get("temperature")) is not None:
+                try:
+                    value = float(temp)
+                    if self._code["min_temp"] <= value <= self._code["max_temp"]:
+                        self._attr_target_temperature = value
+                except (TypeError, ValueError):
+                    pass
+            # 恢复出来的组合可能不属于当前模式（码库换过/固件升级）—— 收敛一次
+            notes = self._normalize_for_mode(self._active_mode)
+            if notes:
+                _LOGGER.info("IR Hub: 恢复状态时按当前模式调整：%s", "；".join(notes))
+
+        # ---- 可选外部传感器（温度/湿度只显示；功率同步物理遥控器的开/关）----
+        if self._temperature_sensor:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, [self._temperature_sensor],
+                    self._async_temp_sensor_changed_event,
+                )
+            )
+            state = self.hass.states.get(self._temperature_sensor)
+            if state is not None and state.state not in (
+                STATE_UNKNOWN, STATE_UNAVAILABLE
+            ):
+                self._async_update_temp(state)
+
+        if self._humidity_sensor:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, [self._humidity_sensor],
+                    self._async_humidity_sensor_changed_event,
+                )
+            )
+            state = self.hass.states.get(self._humidity_sensor)
+            if state is not None and state.state not in (
+                STATE_UNKNOWN, STATE_UNAVAILABLE
+            ):
+                self._async_update_humidity(state)
+
+        if self._power_sensor:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, [self._power_sensor],
+                    self._async_power_sensor_changed_event,
+                )
+            )
 
     # ------------------------------------------------------------------ 能力声明
     # ⚠️ 这四个都是 **property**（不是 `_attr_*` 常量）：HA 每次写状态都会重新读，
@@ -316,9 +378,14 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         return self.hass.config.units.temperature_unit
 
     @property
-    def current_temperature(self) -> None:
-        # 红外空调拿不到室温；不伪造（不设 = 卡片不显示当前温度）
-        return None
+    def current_temperature(self) -> float | None:
+        """室温 —— 只做**显示**，来自选项里配的温度传感器（没配 = 不显示）。"""
+        return self._current_temperature
+
+    @property
+    def current_humidity(self) -> float | None:
+        """湿度 —— 同上，来自选项里配的湿度传感器（没配 = 不显示）。"""
+        return self._current_humidity
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -337,7 +404,90 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
             "ir_hub_fans_by_mode": self._caps_fans,
             "ir_hub_temps_by_mode": self._caps_temps,
             "ir_hub_swing_modes": self._swing_modes,
+            # 可选传感器（选项里配的实体 id，空 = 没配）与功率判定标记
+            "ir_hub_temperature_sensor": self._temperature_sensor or None,
+            "ir_hub_humidity_sensor": self._humidity_sensor or None,
+            "ir_hub_power_sensor": self._power_sensor or None,
+            "ir_hub_on_by_remote": self._on_by_remote,
         }
+
+    # ------------------------------------------------- 外部传感器（可选，对齐 SmartAC）
+
+    async def _async_temp_sensor_changed_event(self, event) -> None:
+        """温度传感器状态变化 → 刷新显示。"""
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+        self._async_update_temp(new_state)
+        self.async_write_ha_state()
+
+    async def _async_humidity_sensor_changed_event(self, event) -> None:
+        """湿度传感器状态变化 → 刷新显示。"""
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+        self._async_update_humidity(new_state)
+        self.async_write_ha_state()
+
+    async def _async_power_sensor_changed_event(self, event) -> None:
+        """功率（智能插座）传感器 ON/OFF → 同步"物理遥控器开了/关了空调"。
+
+        口径与 SmartAC 一致：**只看 ON/OFF，不看瓦数阈值**（用户插座上接什么
+        电器都有可能，阈值反而不可移植）。
+        ⚠️ 这里**只改状态、不发红外** —— 红外侧其实什么都没做，发状态帧反而
+        可能与物理遥控器的模式打架。
+        """
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        if new_state is None:
+            return
+        if old_state is not None and new_state.state == old_state.state:
+            return
+
+        if new_state.state == STATE_ON and self._attr_hvac_mode == HVACMode.OFF:
+            # 物理遥控器开机了：面板同步成开机状态，模式回到上次开的那个
+            #（没有记录就取第一个可用模式 —— 恒温器卡片上总得显示一个合法模式）。
+            self._on_by_remote = True
+            mode = self._last_on_operation or self._attr_hvac_modes[1]
+            self._attr_hvac_mode = mode
+            notes = self._normalize_for_mode(mode.value)
+            if notes:
+                _LOGGER.info(
+                    "IR Hub: %s 被遥控器打开（功率传感器 ON），按库码能力调整：%s",
+                    self.entity_id,
+                    "；".join(notes),
+                )
+            self.async_write_ha_state()
+            return
+
+        if new_state.state == STATE_OFF and self._attr_hvac_mode != HVACMode.OFF:
+            self._on_by_remote = False
+            self._attr_hvac_mode = HVACMode.OFF
+            self.async_write_ha_state()
+
+    @callback
+    def _async_update_temp(self, state) -> None:
+        """把温度传感器状态解析成数字（解析不了就保持旧值并记日志）。"""
+        try:
+            if state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                self._current_temperature = float(state.state)
+        except (TypeError, ValueError) as ex:
+            _LOGGER.error(
+                "IR Hub: %s 温度传感器 %s 的值读不懂：%s",
+                self.entity_id, state.entity_id, ex,
+            )
+
+    @callback
+    def _async_update_humidity(self, state) -> None:
+        """把湿度传感器状态解析成数字（同上）。"""
+        try:
+            if state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                self._current_humidity = float(state.state)
+        except (TypeError, ValueError) as ex:
+            _LOGGER.error(
+                "IR Hub: %s 湿度传感器 %s 的值读不懂：%s",
+                self.entity_id, state.entity_id, ex,
+            )
 
     # ------------------------------------------------------------------ 发射通道
 
