@@ -6,11 +6,17 @@
 
 实现要点：
   · `InfraredEmitterConsumerEntity` 提供 `_send_command()` 与 emitter 可用性跟随。
-  · 每次状态变更 = 从 AC 码库查 `[模式][风速][温度]` 的一帧带符号时序发出。
+  · 每次状态变更 = 从 AC 码库查 `[模式][风速][温度]`（+ 摆风档）的一帧带符号时序发出。
     空调是"全状态帧"协议：改温度就重发整帧，不是"温度+/-"增量键。
-  · `RestoreEntity`：重启后恢复模式/风速/温度。物理遥控器改的状态看不到
-    （红外单向，与 SmartAC 一致）。
-  · off 有专用帧（`commands["off"]`）；开机/调温/调风共用"状态帧"。
+  · **能力按"当前模式"动态声明**（`fan_modes` / `min_temp` / `max_temp` /
+    `supported_features` 都是 property）—— 库码里每个模式的可用风速与温度范围
+    并不相同（实测 525 个 bin 文件中 353 个至少有一个模式没有温度维度、338 个
+    各模式的风速集合不同），声明成全模式并集就会让面板给出不存在的组合。
+  · **取帧永不因"组合不存在"失败**：一律走 `ac_library.frame_for()`，不支持的分量
+    按该模式/风速的能力替换并记日志。只有"整个模式×风速下一帧都没有"才报错。
+  · `RestoreEntity`：重启后恢复模式/风速/温度/摆风。物理遥控器改的状态看不到
+    （红外单向，没有状态回读）。
+  · off 有专用帧（`commands["off"]`）；开机/调温/调风/摆风共用"状态帧"。
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .ac_library import AcLibrary
+from .ac_library import AcLibrary, frame_for
 from .const import (
     CONF_BRAND,
     CONF_CARRIER,
@@ -119,24 +125,33 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         self._carrier = int(data.get(CONF_CARRIER) or DEFAULT_CARRIER)
         self._repeats = max(1, int(data.get(CONF_REPEATS) or DEFAULT_REPEATS))
 
+        # ---- 按模式的能力表（见 ac_library.decode_bin）----
+        # 为什么不能只用 code["fan_modes"] / min_temp / max_temp：那三个是**全模式并集**。
+        self._caps_fans: dict[str, list[str]] = code.get("fans_by_mode") or {}
+        self._caps_temps: dict[str, list[int]] = code.get("temps_by_mode") or {}
+        self._swing_modes: list[str] = list(code.get("swing_modes") or [])
+
         # ---- 状态（随后被 RestoreEntity 覆盖）----
         self._attr_hvac_mode = HVACMode.OFF
-        self._attr_fan_mode = code["fan_modes"][0]
-        self._attr_target_temperature = float(code["min_temp"])
         self._last_on_operation: HVACMode | None = None
-
-        # ---- 能力声明 ----
         self._attr_hvac_modes = [HVACMode.OFF] + [
             HVACMode(m) for m in code["modes"]
         ]
-        self._attr_fan_modes = code["fan_modes"]
-        self._attr_min_temp = float(code["min_temp"])
-        self._attr_max_temp = float(code["max_temp"])
-        self._attr_supported_features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE
-            | ClimateEntityFeature.FAN_MODE
-            | ClimateEntityFeature.TURN_ON
-            | ClimateEntityFeature.TURN_OFF
+        # 初始风速/温度取"第一个开机的模式"的能力，而不是全库并集 ——
+        # 否则一上来就有一个该模式不支持的风速，面板显示的就是个无效值。
+        first_mode = (
+            self._attr_hvac_modes[1].value
+            if len(self._attr_hvac_modes) > 1
+            else HVACMode.COOL.value
+        )
+        init_fans = self._fans_of(first_mode)
+        self._attr_fan_mode = init_fans[0] if init_fans else "auto"
+        init_temps = self._temps_of(first_mode)
+        self._attr_target_temperature = float(
+            init_temps[0] if init_temps else code["min_temp"]
+        )
+        self._attr_swing_mode: str | None = (
+            self._swing_modes[0] if self._swing_modes else None
         )
 
         self._attr_unique_id = entry.entry_id
@@ -150,15 +165,69 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
         )
 
         _LOGGER.debug(
-            "IR Hub climate created: %s %s (modes=%s, fans=%s, temp=%d-%d) via %s",
+            "IR Hub climate created: %s %s (modes=%s, fans=全模式并集%s, "
+            "按模式风速=%s, 按模式温度=%s, 摆风=%s) via %s",
             brand,
             model_short,
             code["modes"],
             code["fan_modes"],
-            code["min_temp"],
-            code["max_temp"],
+            self._caps_fans,
+            {k: (v[:1] + [".."] + v[-1:] if len(v) > 2 else v) for k, v in self._caps_temps.items()},
+            self._swing_modes or "无",
             self._infrared_emitter_entity_id,
         )
+
+    # ------------------------------------------------------- 按模式的能力（核心）
+
+    def _fans_of(self, mode: str) -> list[str]:
+        """该模式**真正可用**的风速；不知道就退回全模式并集（保守）。"""
+        return self._caps_fans.get(mode) or self._code["fan_modes"]
+
+    def _temps_of(self, mode: str) -> list[int]:
+        """该模式**真正可用**的温度；空列表 = 这个模式没有温度维度（如 fan_only）。"""
+        return list(self._caps_temps.get(mode) or [])
+
+    @property
+    def _active_mode(self) -> str:
+        """声明能力时用哪个模式：关机时用"下次开机会用的那个"。
+
+        关机状态下也要能正确地显示风速/温度选项 —— 用来开机的模式就是
+        `_last_on_operation`（没有则第一个可用模式）。
+        """
+        if self._attr_hvac_mode != HVACMode.OFF:
+            return self._attr_hvac_mode.value
+        if self._last_on_operation is not None:
+            return self._last_on_operation.value
+        modes = [m for m in self._attr_hvac_modes if m != HVACMode.OFF]
+        return modes[0].value if modes else HVACMode.COOL.value
+
+    def _normalize_for_mode(self, mode: str) -> list[str]:
+        """把当前风速/温度**收敛到目标模式支持的范围**，返回需要记日志的说明。
+
+        ⚠️ 这一步是"按了必执行"的关键：风机与温度是**模式相关**的（实测 525 个
+        bin 文件中 338 个各模式风速集合不同、353 个至少一个模式没温度）。
+        切模式时如果不收敛，面板上留着的旧风速就会落进"该模式不存在"的位置。
+        """
+        notes: list[str] = []
+
+        fans = self._fans_of(mode)
+        if fans and self._attr_fan_mode not in fans:
+            notes.append(f"风速 {self._attr_fan_mode} 在 {mode} 下不可用 → {fans[0]}")
+            self._attr_fan_mode = fans[0]
+
+        temps = self._temps_of(mode)
+        if temps:
+            current = float(self._attr_target_temperature)
+            if not temps[0] <= current <= temps[-1]:
+                nearest = min(temps, key=lambda t: (abs(t - current), t))
+                notes.append(f"温度 {current:g}°C 不在 {mode} 的范围 → {nearest}°C")
+                self._attr_target_temperature = float(nearest)
+            elif int(current) not in temps:
+                # 范围对但该值被禁用（BAN 里点名禁掉的那几个）
+                nearest = min(temps, key=lambda t: (abs(t - current), t))
+                notes.append(f"温度 {current:g}°C 被 {mode} 禁用 → {nearest}°C")
+                self._attr_target_temperature = float(nearest)
+        return notes
 
     # ------------------------------------------------------------------ 恢复
 
@@ -177,17 +246,68 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
             self._attr_hvac_mode = HVACMode(last.state)
             if last.state != HVACMode.OFF.value:
                 self._last_on_operation = HVACMode(last.state)
-        if (fan := last.attributes.get("fan_mode")) in (
-            self._attr_fan_modes or []
-        ):
+        if (fan := last.attributes.get("fan_mode")) in self._fans_of(self._active_mode):
             self._attr_fan_mode = fan
+        if (swing := last.attributes.get("swing_mode")) in self._swing_modes:
+            self._attr_swing_mode = swing
         if (temp := last.attributes.get("temperature")) is not None:
             try:
                 value = float(temp)
-                if self._attr_min_temp <= value <= self._attr_max_temp:
+                if self._code["min_temp"] <= value <= self._code["max_temp"]:
                     self._attr_target_temperature = value
             except (TypeError, ValueError):
                 pass
+        # 恢复出来的组合可能不属于当前模式（码库换过/固件升级）—— 收敛一次
+        notes = self._normalize_for_mode(self._active_mode)
+        if notes:
+            _LOGGER.info("IR Hub: 恢复状态时按当前模式调整：%s", "；".join(notes))
+
+    # ------------------------------------------------------------------ 能力声明
+    # ⚠️ 这四个都是 **property**（不是 `_attr_*` 常量）：HA 每次写状态都会重新读，
+    #    所以面板在切模式后会自动换成该模式真实可用的选项。
+
+    @property
+    def fan_modes(self) -> list[str]:
+        """当前模式下可用的风速（不是全模式并集）。"""
+        return list(self._fans_of(self._active_mode))
+
+    @property
+    def min_temp(self) -> float:
+        """当前模式的温度下限；该模式没有温度维度时退回全库并集（前端兜底用）。"""
+        temps = self._temps_of(self._active_mode)
+        return float(temps[0]) if temps else float(self._code["min_temp"])
+
+    @property
+    def max_temp(self) -> float:
+        temps = self._temps_of(self._active_mode)
+        return float(temps[-1]) if temps else float(self._code["max_temp"])
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        """按当前模式给能力位。
+
+        `fan_only` / 某些 `dry` 没有温度维度 ⇒ **不声明 TARGET_TEMPERATURE**，
+        面板就不显示温度滑条（而不是显示一个按了报错的滑条）。
+        """
+        features = (
+            ClimateEntityFeature.FAN_MODE
+            | ClimateEntityFeature.TURN_ON
+            | ClimateEntityFeature.TURN_OFF
+        )
+        if self._temps_of(self._active_mode):
+            features |= ClimateEntityFeature.TARGET_TEMPERATURE
+        if self._swing_modes:
+            features |= ClimateEntityFeature.SWING_MODE
+        return features
+
+    @property
+    def swing_modes(self) -> list[str] | None:
+        """这台空调能选的摆风档；空 = 库码里没有摆风（则不声明 SWING_MODE）。"""
+        return list(self._swing_modes) or None
+
+    @property
+    def swing_mode(self) -> str | None:
+        return self._attr_swing_mode
 
     # ------------------------------------------------------------------ 属性
 
@@ -212,6 +332,11 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
             "last_on_operation": (
                 self._last_on_operation.value if self._last_on_operation else None
             ),
+            # 能力表原样摊出来 —— 面板给出的选项不对劲时，照这个对就知道
+            # 是库码声明如此还是集成算错了。
+            "ir_hub_fans_by_mode": self._caps_fans,
+            "ir_hub_temps_by_mode": self._caps_temps,
+            "ir_hub_swing_modes": self._swing_modes,
         }
 
     # ------------------------------------------------------------------ 发射通道
@@ -234,34 +359,60 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ 设置
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """切模式；关机的帧由 _send_state_frame 按 OFF 分支处理。"""
+        """切模式；先把风速/温度收敛到该模式支持的范围，再发状态帧。"""
         self._attr_hvac_mode = hvac_mode
         if hvac_mode != HVACMode.OFF:
             self._last_on_operation = hvac_mode
+            notes = self._normalize_for_mode(hvac_mode.value)
+            if notes:
+                _LOGGER.info(
+                    "IR Hub: %s 切到 %s，按库码能力调整：%s",
+                    self.entity_id,
+                    hvac_mode.value,
+                    "；".join(notes),
+                )
         await self._send_state_frame()
         self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """改温度（超出码库范围就忽略 + 警告）。"""
+        """改温度。
+
+        ⚠️ 不再"越界就忽略"：先按当前模式的能力把值收敛到最近的可用温度
+        （模式没温度维度的则原样保留，发帧时用哨兵温度），保证按了必执行。
+        """
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
-        if not self._attr_min_temp <= float(temperature) <= self._attr_max_temp:
-            _LOGGER.warning(
-                "IR Hub: 温度 %s 超出 %d~%d，忽略",
-                temperature,
-                self._attr_min_temp,
-                self._attr_max_temp,
-            )
-            return
         self._attr_target_temperature = float(temperature)
+        notes = self._normalize_for_mode(self._active_mode)
+        if notes:
+            _LOGGER.info(
+                "IR Hub: %s 温度按库码能力调整：%s", self.entity_id, "；".join(notes)
+            )
         if self._attr_hvac_mode != HVACMode.OFF:
             await self._send_state_frame()
         self.async_write_ha_state()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        """改风速。"""
+        """改风速（该模式不支持的会被换成该模式第一个可用风速，并记日志）。"""
         self._attr_fan_mode = fan_mode
+        notes = self._normalize_for_mode(self._active_mode)
+        if notes:
+            _LOGGER.info(
+                "IR Hub: %s 风速按库码能力调整：%s", self.entity_id, "；".join(notes)
+            )
+        if self._attr_hvac_mode != HVACMode.OFF:
+            await self._send_state_frame()
+        self.async_write_ha_state()
+
+    async def async_set_swing_mode(self, swing_mode: str) -> None:
+        """改摆风。
+
+        库码里有两种摆风（见 `ac_library._swing_options`）：状态帧里的一个 bit
+        （直接重发状态帧即生效），或是独立功能帧（`function_code=6` 叠在**当前状态**
+        上发出 —— 与遥控器按那颗摆风键等价）。两者在这里是同一条路径。
+        """
+        self._attr_swing_mode = swing_mode
         if self._attr_hvac_mode != HVACMode.OFF:
             await self._send_state_frame()
         self.async_write_ha_state()
@@ -284,32 +435,47 @@ class IrHubClimate(InfraredEmitterConsumerEntity, ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ 发送
 
     async def _send_state_frame(self) -> None:
-        """把当前 (模式, 风速, 温度) 对应的一帧状态码发给 emitter。"""
+        """把当前 (模式, 风速, 温度, 摆风) 对应的一帧状态码发给 emitter。
+
+        ⚠️ 取帧一律走 `ac_library.frame_for()` —— 它会把该模式不支持的
+        风速/温度/摆风档替换成可用的值并返回说明。这样面板/自动化给出的任何组合
+        都能发出**某一帧**，不会出现"按了不执行"。
+        """
         if self._attr_hvac_mode == HVACMode.OFF:
             timings = self._code["off"]
         else:
-            fans = self._code["commands"].get(self._attr_hvac_mode.value) or {}
-            temps = fans.get(self._attr_fan_mode) or {}
-            timings = temps.get(str(int(self._attr_target_temperature)))
+            timings, notes = frame_for(
+                self._code,
+                self._attr_hvac_mode.value,
+                self._attr_fan_mode,
+                self._attr_target_temperature,
+                self._attr_swing_mode,
+            )
+            if notes:
+                _LOGGER.info(
+                    "IR Hub: %s 按库码能力取帧时做了替换：%s",
+                    self.entity_id,
+                    "；".join(notes),
+                )
             if timings is None:
-                # 该 模式×风速×温度 组合在这台空调的码库里不存在（如制热无低风）
-                # —— 报清楚，别静默发错帧。
+                # 组合不存在的情况已经在 frame_for 里替换掉了，走到这里只剩
+                # "这台型号在这个模式×风速下一条帧都没有"（码库数据异常）。
                 raise HomeAssistantError(
-                    f"IR Hub: {self._attr_device_info['name']} 不支持组合 "
-                    f"模式={self._attr_hvac_mode.value} / 风速={self._attr_fan_mode} / "
-                    f"温度={int(self._attr_target_temperature)}°C。"
-                    f"该模式可用风速：{sorted(fans) or '无'}"
+                    f"IR Hub: {self._attr_device_info['name']} 的模式 "
+                    f"{self._attr_hvac_mode.value} 在库码里没有任何可用帧"
+                    f"（数据异常，请重加集成或换型号）"
                 )
 
         await self._send_command(
             build_raw_command(timings, carrier=self._carrier, repeats=self._repeats)
         )
         _LOGGER.debug(
-            "IR Hub: %s -> mode=%s fan=%s temp=%s (%d timings, carrier=%d)",
+            "IR Hub: %s -> mode=%s fan=%s temp=%s swing=%s (%d timings, carrier=%d)",
             self.entity_id,
             self._attr_hvac_mode,
             self._attr_fan_mode,
             self._attr_target_temperature,
+            self._attr_swing_mode,
             len(timings),
             self._carrier,
         )

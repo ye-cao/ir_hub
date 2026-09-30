@@ -2349,7 +2349,10 @@ def check_ac() -> None:
 
     const_mod = sys.modules["_ir_hub_shim.const"]
     ha_const = sys.modules["homeassistant.const"]
-    HVACMode = sys.modules["homeassistant.components.climate"].HVACMode
+    _climate_mod = sys.modules["homeassistant.components.climate"]
+    HVACMode = _climate_mod.HVACMode
+    # 0.3.11 起 supported_features 是**随模式变化的 property**，断言要直接读它
+    ClimateEntityFeature = _climate_mod.ClimateEntityFeature
 
     # --- A. 码库数据 ---
     ac_mod = load_module(
@@ -2377,15 +2380,51 @@ def check_ac() -> None:
     bad: list[str] = []
     frames = 0
     max_timing = 0
+    # 摆风三分类计数（见 ac_library._swing_options）
+    swing_kinds = {"状态帧": 0, "独立帧": 0, "无": 0}
     for bin_name in bins:
         try:
             code = ac_lib.load_device(bin_name)
             assert code["modes"], bin_name
             assert code["off"] and code["off"][0] > 0, bin_name
+
+            # 能力表必须与 commands 的实际层数自洽（面板就是照能力表声明的）
+            fans_by_mode = code["fans_by_mode"]
+            temps_by_mode = code["temps_by_mode"]
+            names = code["swing_modes"]
+            assert list(fans_by_mode) == code["modes"], "fans_by_mode 的模式集不符"
+            assert list(temps_by_mode) == code["modes"], "temps_by_mode 的模式集不符"
+            assert names == [o["name"] for o in code["swing"]], "swing_modes 与 swing 不符"
+            for mode, mode_fans in fans_by_mode.items():
+                assert mode_fans == [
+                    f for f in code["fan_modes"] if f in mode_fans
+                ], f"{mode}: 风速顺序与并集不一致"
+                expect_temps = max(1, len(temps_by_mode[mode]))
+                for fan in mode_fans:
+                    node = code["commands"][mode][fan]
+                    layers = [node[n] for n in names] if names else [node]
+                    assert all(
+                        len(temps) == expect_temps for temps in layers
+                    ), f"{mode}/{fan}: 温度键数与能力表不符"
+
+            if names:
+                swing_kinds[
+                    "状态帧" if code["swing"][1]["level"] is not None else "独立帧"
+                ] += 1
+            else:
+                swing_kinds["无"] += 1
+
             all_frames = [code["off"]]
             for fans in code["commands"].values():
-                for temps in fans.values():
-                    all_frames.extend(temps.values())
+                for node in fans.values():
+                    # 支持摆风的型号多一层（commands[mode][fan][摆风档][温度]）
+                    layers = (
+                        [node[name] for name in code["swing_modes"]]
+                        if code["swing_modes"]
+                        else [node]
+                    )
+                    for temps in layers:
+                        all_frames.extend(temps.values())
             for frame in all_frames:
                 frames += 1
                 if frame[0] <= 0 or not any(v < 0 for v in frame):
@@ -2408,10 +2447,79 @@ def check_ac() -> None:
         max_timing <= MAX_SANE_TIMING_US,
         f"AC 最大单段时长 {max_timing} µs ≤ {MAX_SANE_TIMING_US} µs",
     )
+    check(
+        sum(swing_kinds.values()) == len(bins) and swing_kinds["状态帧"] > 300,
+        f"摆风三分类：状态帧 {swing_kinds['状态帧']} / 独立帧 {swing_kinds['独立帧']}"
+        f" / 无 {swing_kinds['无']}（合计 {len(bins)}）",
+    )
+
+    # --- B2. 门禁：任何组合都必须能取到帧 ---
+    # 用户原话（2026-09-30）：「不应该有按了不执行情况」「绝大部分品牌空调器面板
+    # 都有这个问题」。所以这里**穷举全库**：每型号 × 每模式 × 每风速 × 边界温度
+    # （低于/高于库范围 + 该型号 min/max）× 每摆风档（含"不指定"），
+    # `frame_for` 必须永远给出非空时序 —— 空就是面板上会「按了不执行」的角落。
+    dead: list[str] = []
+    combos = 0
+    for bin_name in bins:
+        code = ac_lib.load_device(bin_name)
+        swing_axes = [None] + list(code["swing_modes"] or [])
+        for mode in code["modes"]:
+            for fan in code["fans_by_mode"][mode]:
+                for temp in (code["min_temp"] - 5, code["min_temp"],
+                             code["max_temp"], code["max_temp"] + 5):
+                    for swing in swing_axes:
+                        combos += 1
+                        frame, _notes = ac_mod.frame_for(
+                            code, mode, fan, temp, swing
+                        )
+                        if not frame:
+                            dead.append(f"{bin_name} {mode}/{fan}/{temp}/{swing}")
+    check(
+        not dead,
+        f"全库 {len(bins)} 型号 × {combos} 种组合 frame_for 均给出非空时序"
+        f"（面板不会『按了不执行』）",
+        "; ".join(dead[:3]),
+    )
+
+    # 锚点：美的 11837 —— 用户 2026-09-30 实测报「fan_only 组合报错 + 没有摆风」的那台。
+    # 钉住它，就钉住了"按模式的能力表"和"独立摆风帧"两条修复。
+    code_11837 = ac_lib.load_device("irda_new_ac_11837.bin")
+    check(
+        code_11837["fans_by_mode"]["auto"] == ["auto"]
+        and code_11837["fans_by_mode"]["dry"] == ["auto"]
+        and code_11837["fans_by_mode"]["cool"] == ["auto", "low", "medium", "high"],
+        "锚点 11837：auto/dry 只有自动风、cool/heat/fan_only 四档",
+        f"实际 {code_11837['fans_by_mode']}",
+    )
+    check(
+        code_11837["temps_by_mode"]["fan_only"] == []
+        and code_11837["temps_by_mode"]["cool"] == list(range(17, 31)),
+        "锚点 11837：fan_only 无温度维度（旧实现正是在这里报『不支持组合』）、cool 17~30",
+        f"实际 {code_11837['temps_by_mode']}",
+    )
+    check(
+        code_11837["swing_modes"] == ["off", "on"]
+        and code_11837["swing"][1]["function"] == 6
+        and code_11837["swing"][1]["level"] is None,
+        "锚点 11837：摆风走独立功能帧（function 6）而不是状态位",
+        f"实际 {code_11837['swing']}",
+    )
+    _f, _n = ac_mod.frame_for(code_11837, "fan_only", "high", 30)
+    check(
+        _f is not None and len(_f) == 200 and _n == [],
+        "frame_for 在 11837 的 fan_only/high/30°C 上直接给出一帧且无需替换",
+        f"实际 notes={_n}",
+    )
+    _f, _n = ac_mod.frame_for(code_11837, "auto", "high", 30)
+    check(
+        _f is not None and len(_n) == 1 and "auto" in _n[0],
+        "frame_for 在 11837 的 auto/high（库码只有自动风）上替换风速并说明原因",
+        f"实际 notes={_n}",
+    )
 
     # 锚点：美的 11272（SmartAC 实配过的型号），钉住模式集与引导码
     code = ac_lib.load_device("irda_new_ac_11272.bin")
-    frame = code["commands"]["cool"]["auto"]["26"]
+    frame, _frames_notes = ac_mod.frame_for(code, "cool", "auto", 26)
     check(
         code["modes"] == ["cool", "heat", "auto", "fan_only", "dry"]
         and code["min_temp"] == 17
@@ -2471,10 +2579,13 @@ def check_ac() -> None:
         == ["off", "cool", "heat", "auto", "fan_only", "dry"],
         "hvac_modes = off + 码库 5 模式",
     )
-    check(entity._attr_fan_modes == ["auto", "low", "medium", "high"], "fan_modes 4 档")
     check(
-        entity._attr_min_temp == 17.0 and entity._attr_max_temp == 30.0,
-        "min/max 温度来自码库（17/30）",
+        entity.fan_modes == ["auto", "low", "medium", "high"],
+        "fan_modes（cool 模式）= 4 档",
+    )
+    check(
+        entity.min_temp == 17.0 and entity.max_temp == 30.0,
+        "min/max 温度随当前模式（cool → 17/30）",
     )
 
     async def run():
@@ -2519,20 +2630,86 @@ def check_ac() -> None:
             entity._attr_target_temperature == 24.0 and len(entity.sent) == 0,
             "关机状态 set_temperature -> 只记状态不发码",
         )
-        # 组合不存在 -> 清晰报错（人为裁掉 high 风）
+        # ---- 按模式的动态能力（本次修复的核心，2026-09-30 用户实测）----
+        # 库码里每个模式的风速/温度范围并**不相同**（实测 342/509 个 bin 至少有一个
+        # 模式没有温度维度、330/509 个 bin 各模式风速集合不同）。声明成全模式并集
+        # 就会让面板给出不存在的组合，用户看到的是"按了报错不执行"。
         entity = build()
-        entity._code = dict(code)
-        entity._code["commands"] = {"cool": {"auto": code["commands"]["cool"]["auto"]}}
+        check(
+            entity.fan_modes == ["auto", "low", "medium", "high"],
+            "cool 模式声明 4 档风速",
+        )
+        entity._attr_hvac_mode = HVACMode.AUTO
+        check(entity.fan_modes == ["auto"], "auto 模式只声明 1 档风速（库码如此）")
+        check(
+            entity.min_temp == 17.0 and entity.max_temp == 30.0,
+            "auto 模式有温度维度 -> 17~30",
+        )
+        entity._attr_hvac_mode = HVACMode.FAN_ONLY
+        check(
+            not (entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE),
+            "fan_only 无温度维度 -> 不声明 TARGET_TEMPERATURE（面板不显示温度滑条）",
+        )
+        entity = build()
+        entity._attr_hvac_mode = HVACMode.DRY
+        check(entity.fan_modes == ["auto"], "dry 模式只声明 1 档风速")
+
+        # ---- 「按了必执行」：库码里不存在的组合也发得出去（不再抛异常）----
+        entity = build()
+        entity._attr_hvac_mode = HVACMode.AUTO
+        await entity.async_set_fan_mode("high")          # auto 模式没有 high
+        check(
+            entity._attr_fan_mode == "auto" and len(entity.sent) == 1,
+            "auto + high（库码没有）-> 自动换成 auto 并真的发出 1 帧",
+        )
+        entity = build()
+        entity._attr_hvac_mode = HVACMode.FAN_ONLY
+        await entity.async_set_temperature(temperature=30)   # fan_only 无温度
+        check(
+            len(entity.sent) == 1
+            and len(entity.sent[0].get_raw_timings()) == 200,
+            "fan_only + 30°C（该模式无温度）-> 照样发出状态帧，不报错",
+        )
+        entity = build()
         entity._attr_hvac_mode = HVACMode.COOL
-        try:
-            await entity.async_set_fan_mode("high")
-        except HomeAssistantError as err:
-            check(
-                "不支持组合" in str(err) and "high" in str(err),
-                "不存在的模式×风速组合 -> HomeAssistantError 带可用项",
-            )
-        else:
-            check(False, "不存在的模式×风速组合 -> HomeAssistantError", "竟然没抛")
+        await entity.async_set_temperature(temperature=35)   # 超出 17~30
+        check(
+            entity._attr_target_temperature == 30.0 and len(entity.sent) == 1,
+            "cool + 35°C（超范围）-> 收敛到最近的 30°C 并发出",
+        )
+        # 切模式时把不再可用的旧风速收敛掉（否则面板上留着无效值）
+        entity = build()
+        entity._attr_hvac_mode = HVACMode.COOL
+        entity._attr_fan_mode = "high"
+        await entity.async_set_hvac_mode(HVACMode.AUTO)
+        check(
+            entity._attr_fan_mode == "auto" and len(entity.sent) == 1,
+            "cool/high -> 切 auto（只有 auto 档）-> 风速收敛为 auto 并发出",
+        )
+
+        # ---- 摆风 ----
+        check(
+            entity.swing_modes == ["off", "on"]
+            and bool(entity.supported_features & ClimateEntityFeature.SWING_MODE),
+            "11272 库码有独立摆风帧 -> 声明 off/on 两档摆风",
+        )
+        _plain = code["commands"]["cool"]["auto"]["off"]["26"]
+        entity = build()
+        entity._attr_hvac_mode = HVACMode.COOL
+        await entity.async_set_swing_mode("on")
+        check(
+            len(entity.sent) == 1
+            and entity.sent[0].get_raw_timings() != _plain,
+            "set_swing_mode(on) -> 发出的帧与 off 档不同（function 6 已叠加）",
+        )
+        # 库码里没有摆风的型号 -> 不该声明 SWING_MODE
+        entity = build()
+        entity._swing_modes = []
+        check(
+            entity.swing_modes is None
+            and not (entity.supported_features & ClimateEntityFeature.SWING_MODE),
+            "库码无摆风的型号 -> swing_modes 为 None 且不声明 SWING_MODE",
+        )
         # RestoreEntity：历史状态 heat / medium / 25
         entity = build()
 
@@ -2653,16 +2830,21 @@ def check_ac() -> None:
             f"开机帧非空且带符号（{len(on_timings)} 个时序值）",
         )
         # 选帧对齐 SmartAC async_test：mode/fan 优先 auto，温度优先 26、否则取第一个
-        # （11272 的 auto 模式只有 17~24 ⇒ 实发 auto/auto/17）
+        # （11272 的 auto 模式 17~30 全在，故实发 auto/auto/26°C）
+        # ⚠️ 0.3.11 起 commands 层数随摆风变化（四层），**不能自己摸层数** ——
+        #    统一用 frame_for() 取帧，它按能力表就近替换并返回 note 列表。
         ac_code = flow._ac_code
         _m = "auto" if "auto" in ac_code["commands"] else next(iter(ac_code["commands"]))
         _f = "auto" if "auto" in ac_code["commands"][_m] else next(iter(ac_code["commands"][_m]))
-        _t = ac_code["commands"][_m][_f]
-        _k = "26" if "26" in _t else next(iter(_t))
-        expect_on = _t[_k]
+        expect_on, _notes = ac_mod.frame_for(ac_code, _m, _f, 26)
         check(
             on_timings == expect_on,
-            f"开机帧 = {_m}/{_f}/{_k}°C（对齐 SmartAC async_test 选帧逻辑）",
+            f"开机帧 = {_m}/{_f}/26°C（对齐 SmartAC async_test 选帧逻辑）",
+        )
+        check(
+            _notes == [],
+            f"开机帧取的是 {_m}/{_f}/26°C 原样组合、无需就近替换",
+            f"实际替换说明 {_notes!r}",
         )
         # 有反应 -> 进第二段（关机帧）
         infrared.STUB_SENT.clear()
@@ -2758,6 +2940,11 @@ def main() -> int:
     #        详见「⑩ 学习模式」段：mode/abort/订阅/no_signal/单键/双键/pick/test/entry
     #      + [13] learn_match 不变式 7 项  = 223
     #      + ⑪ 空调也能配对 13 项          = 236
+    #        （⑪ 明细：选空调大类 / 捕获电源键 / 占位符改写 / 单键候选含真值 /
+    #          共用码候选名不冒认品牌 / 进 ac_test_on + 真发帧 /
+    #          共用码实测文案 / retry 退回候选 / ok 进 ac_test /
+    #          entry 校验（共用码品牌留空）/ 跨品牌『自动试下一个』 /
+    #          两键交集仍含真值）
     #      + 接收端诊断 2 项（接收器状态探针 / 订阅失败不再冒充没信号） = 238
     #      + 0 帧病因护栏 3 项（解析出 3 种病因 / 每语言都覆盖这 3 个 error 键 /
     #        实体不存在 -> receiver_unavailable）                    = 241
@@ -2769,12 +2956,28 @@ def main() -> int:
     #        分类器 4 类互不混淆 + 账本累计 = 3 + 留原始样本）          = 252
     #      + 空调结构预筛幸存数 3 项（真值帧幸存数远离阈值 / 低分+幸存≈1 说
     #        『不在码库』/ 低分+幸存正常 说『捕获被记坏』——两者结论相反）  = 255
-    #        （⑪ 明细：选空调大类 / 捕获电源键 / 占位符改写 / 单键候选含真值 /
-    #          共用码候选名不冒认品牌 / 进 ac_test_on + 真发帧 /
-    #          共用码实测文案 / retry 退回候选 / ok 进 ac_test /
-    #          entry 校验（共用码品牌留空）/ 跨品牌『自动试下一个』 /
-    #          两键交集仍含真值）
-    expected_total = 259
+    #      + 0.3.10 burst 前缀容错 3 项（burst_prefixes 能在内部 gap 截出原帧 /
+    #        capture_candidates 前两项仍向后兼容 / 合并帧仍排第 1）        = 258
+    #      + 0.3.10 空调配对实测帧 1 项（ac_test_on 立即发开机帧）        = 259
+    #      + 0.3.11 按模式能力表 + 摆风 20 项（本段新增；同时删掉旧用例
+    #        「不存在的模式×风速组合 -> HomeAssistantError」——那个行为正是
+    #        用户 2026-09-30 要求废除的，故净 +19 = 278）：
+    #        ① 摆风三分类合计 = bin 数（状态帧 / 独立帧 / 无）            +1
+    #        ② 全库「无所不能」门禁 1 条：525 型号 × 91936 种组合
+    #           （模式 × 风速 × 边界温度 × 每摆风档）frame_for 均非空
+    #           —— 直接钉死用户那句「不应该有按了不执行情况」            +1
+    #        ③ 11837 锚点 5 条（用户实测报错的那台）：auto/dry 只有自动风 /
+    #           fan_only 无温度维度 / 摆风走独立功能帧 function 6 /
+    #           frame_for 在 fan_only·high·30°C 直接给帧 /
+    #           frame_for 在 auto·high 替换风速并说明原因                +5
+    #        ④ 11272 声明 off/on 摆风 + 开机帧取 auto/auto/26 无需替换    +2
+    #        ⑤ climate 动态能力与「永不报错」11 条：cool 4 档风 /
+    #           auto 只 1 档风 / auto 有 17~30 / dry 只 1 档风 /
+    #           fan_only 不声明 TARGET_TEMPERATURE / auto+high 自动换 auto
+    #           并真的发出 / fan_only+30°C 照样发 / cool+35°C 收敛到 30 /
+    #           切模式收敛风速 / set_swing_mode 的帧与 off 档不同 /
+    #           无摆风的型号不声明 SWING_MODE                            +11
+    expected_total = 278
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(

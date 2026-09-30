@@ -577,16 +577,25 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _ac_on_frame(self) -> list[int]:
-        """开机实测帧：mode/fan 优先 auto、温度优先 26（SmartAC 同款选帧逻辑）。"""
-        commands = (self._ac_code or {}).get("commands") or {}
+        """开机实测帧：mode/fan 优先 auto、温度优先 26（SmartAC 同款选帧逻辑）。
+
+        ⚠️ 温度**不用** `frame_for` 的"就近替换"：这里只要发出一帧有效的来验证
+        发射链路，取 26、没有就取第一个（保持旧行为，别让实测帧随实现漂移）。
+        ⚠️ 支持摆风的型号多一层（`[mode][fan][摆风档][temp]`）—— 取第一个档位。
+        """
+        code = self._ac_code or {}
+        commands = code.get("commands") or {}
         if not commands:
             return []
         mode_key = "auto" if "auto" in commands else next(iter(commands))
         fans = commands[mode_key]
         fan_key = "auto" if "auto" in fans else next(iter(fans))
-        temps = fans[fan_key]
-        temp_key = "26" if "26" in temps else next(iter(temps))
-        return list(temps[temp_key])
+        node = fans[fan_key]
+        swing_names = code.get("swing_modes") or []
+        if swing_names:
+            node = node[swing_names[0]]
+        temp_key = "26" if "26" in node else next(iter(node))
+        return list(node[temp_key])
 
     async def _ac_advance(self, ac_library: AcLibrary) -> bool | None:
         """「自动试下一个型号」：切到下一个候选并解码。

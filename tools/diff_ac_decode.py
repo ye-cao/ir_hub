@@ -30,9 +30,13 @@ data = open(path, "rb").read()
 print(f"bin: {BIN} ({len(data)} bytes)\n")
 
 # ---- IR Hub ----
+# ⚠️ 0.3.11 起 `commands` 的层数随摆风变化（支持摆风 = 四层），**不能直接索引**；
+#    统一走 frame_for()（swing 缺省 = 默认档，但也就是 SmartAC 的 swing=0/function=1）。
 hub = ac_lib_mod.decode_bin(data)
 hub_off = [abs(t) for t in hub["off"]]
-hub_cool26 = [abs(t) for t in hub["commands"]["cool"]["auto"]["26"]]
+hub_cool26, _notes = ac_lib_mod.frame_for(hub, "cool", "auto", 26)
+hub_cool26 = [abs(t) for t in hub_cool26]   # SmartAC 侧全正，这里也取绝对值对齐
+print(f"IR Hub 摆风：{hub['swing_modes'] or '无'}；取帧说明 {_notes or '无替换'}")
 
 # ---- SmartAC ----
 sa_ac = smartac.AC(data)
