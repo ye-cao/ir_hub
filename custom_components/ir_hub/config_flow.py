@@ -52,7 +52,7 @@ from .const import (
     TX_TYPES,
 )
 from .ir_command import build_raw_command
-from .learn_match import match_timings, normalize_capture
+from .learn_match import capture_features, match_timings, normalize_capture
 from .learn_match_ac import match_ac
 from .library import CodeLibrary
 from .transmitter import async_send_timings, async_validate_target
@@ -128,6 +128,17 @@ LEARN_TEST_OPTIONS = {
 # 按相似度排序后截到 _LEARN_MAX_CANDIDATES 展示。
 _LEARN_TOP_N = 8
 _LEARN_MAX_CANDIDATES = 60
+
+# 学习候选里"看起来对"的相似度下限。连续分口径下（见 learn_match._similarity）：
+# 真帧（在库里）≈0.90~0.95，同协议族近似型号 ≈0.85~0.93，库外遥控的最近邻
+# 通常只有 0.62~0.75（实测：Midea/RCA 族真值 0.945 召回 20 个候选；一只 300 段
+# NEC 系的库外遥控只剩 1 个候选、最高 0.67）。用它给用户一句"信不信"的判词。
+_LEARN_TRUST_SCORE = 0.85
+_LEARN_WEAK_SCORE = 0.75
+
+# 「退回重按」哨兵值。低分/单候选时用户其实无路可走（下拉里全是错的），
+# 没有这一项就只能关掉对话框重来 —— 那等于把"配对失败"变成"配对没有出口"。
+_LEARN_BACK = "__back__"
 # 各通道目标字段的表单提示（description_placeholders 用）
 _TX_TARGET_LABELS = {
     TX_INFRARED: "下拉选择 infrared 发射器实体",
@@ -170,6 +181,9 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._learn_top_score: float = 0.0
         self._learn_used_two_keys: bool = False
         self._from_learn: bool = False               # 是否由"配对"分支进的空调实测步
+        # 订阅接收器失败时的原因（空串 = 订阅正常）。必须留给用户看 —— 订阅失败与
+        # "收到 0 帧"在界面上长得一模一样，吞掉就会变成无从下手的"没反应"。
+        self._learn_subscribe_error: str = ""
 
     # ------------------------------------------------------------------ 工具
 
@@ -743,16 +757,24 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._learn_captures.append((capture, getattr(signal, "modulation", None)))
 
     def _learn_start_capture(self) -> None:
-        """清空缓冲并订阅所选接收器。"""
+        """清空缓冲并订阅所选接收器。
+
+        ⚠️ 订阅失败**不能静默**：`infrared.async_subscribe_receiver` 在实体不存在 /
+        不是 infrared 接收实体时会抛 `HomeAssistantError`，而"订阅失败"与"用户没按"
+        在界面上都表现为「已收到 0 帧」。所以失败原因存进 `_learn_subscribe_error`，
+        由 learn_press / learn_press2 报给用户。
+        """
         self._learn_captures = []
+        self._learn_subscribe_error = ""
         self._learn_stop_capture()
         try:
             self._learn_unsub = infrared.async_subscribe_receiver(
                 self.hass, self._receiver, self._learn_on_signal
             )
-        except Exception:  # noqa: BLE001 —— 接收器消失/实体名失效都要落到表单
+        except Exception as err:  # noqa: BLE001 —— 接收器消失/实体名失效都要落到表单
             _LOGGER.exception("IR Hub learn: 订阅红外接收器失败：%s", self._receiver)
             self._learn_unsub = None
+            self._learn_subscribe_error = f"{type(err).__name__}: {err}"
 
     def _learn_stop_capture(self) -> None:
         """取消接收订阅（幂等）。"""
@@ -767,7 +789,18 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """一次按压常被接收器拆成多帧（重复帧），取元素最多的那帧最干净。"""
         if not self._learn_captures:
             return None
-        return max(self._learn_captures, key=lambda item: len(item[0]))
+        best = max(self._learn_captures, key=lambda item: len(item[0]))
+        # 打日志是为了排障：用户报"配不上"时，这一行就能判断捕获本身是否正常
+        # （段数/首脉冲/全长），不用再猜。
+        count, first, total = capture_features(best[0])
+        _LOGGER.info(
+            "IR Hub learn: 收到 %d 帧，取 %d 段那帧（首脉冲 %d µs / 全长 %d µs）",
+            len(self._learn_captures),
+            count,
+            first,
+            total,
+        )
+        return best
 
     async def async_step_learn_setup(self, user_input: dict | None = None):
         """学习模式第 1 步：发射目标 + 红外接收器 + 设备大类（含空调）。"""
@@ -804,12 +837,79 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders=self._learn_setup_placeholders(library),
         )
 
+    def _receiver_options(self, receivers: list[str]) -> dict[str, str]:
+        """接收器下拉：entity_id → 显示名。
+
+        ⚠️ 显示名必须带上 friendly_name。ESPHome 的实体名会被设备名前缀（"HJY IR 红外接收"），
+        那是**唯一**能分辨"遥控器该对准哪一台"的线索。只列 entity_id 的话，家里有两台以上
+        IR 设备时必然选错 —— 而选错的症状和"按了没收到"完全一样（0 帧），无从察觉。
+        """
+        options: dict[str, str] = {}
+        for entity_id in receivers:
+            state = self.hass.states.get(entity_id)
+            attrs = getattr(state, "attributes", None) or {}
+            name = attrs.get("friendly_name")
+            options[entity_id] = (
+                f"{name}（{entity_id}）" if name and name != entity_id else entity_id
+            )
+        return options
+
+    def _receiver_label(self, entity_id: str | None = None) -> str:
+        """接收器的展示名：friendly_name（含设备名）+ entity_id。"""
+        entity_id = entity_id or self._receiver
+        if not entity_id:
+            return "未选择"
+        return self._receiver_options([entity_id])[entity_id]
+
+    def _receiver_state(self) -> str:
+        """所选接收器的 state —— 判断"帧到底有没有进 HA"的探针。
+
+        `infrared` 的接收实体每收到一帧就把自己的 state 写成**时间戳**
+        （core：`InfraredReceiverEntity._handle_received_signal` → `async_write_ha_state`），
+        所以这个值会随每次按键前进。它的取值本身就把病因说完了：
+
+        - ISO 时间戳 → 帧正在进 HA。此时还报 0 帧，才是本集成的问题。
+        - `unknown`  → 这台接收器**从未**收到过任何一帧（选错了设备 / 遥控器对准的是
+          另一块板子 —— 家里有多台 IR 设备时最容易踩这个）。
+        - `unavailable` → 设备离线。
+        - 实体不存在 → 下拉里的名字已失效（设备被删或改名）。
+
+        实测教训：user 的日志里 `hjy-ir` 持续打印 `[I][remote.pronto]`（帧进的是 HJY 板），
+        而集成订阅的是 `infrared.tcl_ir_4987d0_ir_receiver`（TCL 86 盒面板，
+        `name: tcl_ir` + `name_add_mac_suffix: yes` + `name: IR Receiver`）—— 两块板子，
+        症状就是"0 帧"。只看 entity_id 是看不出这层的，所以必须把设备名与 state 都摆出来。
+        """
+        if not self._receiver:
+            return "未选择"
+        state = self.hass.states.get(self._receiver)
+        if state is None:
+            return "实体不存在（下拉里已经没有这台设备）"
+        value = str(state.state)
+        if value == "unknown":
+            return "unknown —— 这台接收器从未收到过任何一帧"
+        if value == "unavailable":
+            return "unavailable —— 设备离线"
+        return f"{value}（最近一次收到帧的时刻）"
+
+    def _receiver_available(self) -> bool:
+        """接收器实体存在、且不在 `unavailable`。
+
+        ⚠️ `unknown` 不能算不可用 —— 接收实体在**第一次收到帧之前**就是 unknown，
+        把它当成"不可用"会在最需要帮助的时候给出误导性的报错。
+        """
+        if not self._receiver:
+            return False
+        state = self.hass.states.get(self._receiver)
+        if state is None:
+            return False
+        return str(state.state) != "unavailable"
+
     def _learn_setup_schema(self, receivers: list[str]) -> vol.Schema:
         """学习模式第 1 步的表单（大类含空调）。"""
         return vol.Schema(
             {
                 vol.Required(CONF_TX_TARGET): self._tx_target_validator(),
-                vol.Required(CONF_RECEIVER): vol.In({rid: rid for rid in receivers}),
+                vol.Required(CONF_RECEIVER): vol.In(self._receiver_options(receivers)),
                 vol.Required(CONF_CATEGORY): vol.In(self._category_options()),
             }
         )
@@ -830,7 +930,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_show_form(
                     step_id="learn_press",
                     data_schema=vol.Schema({}),
-                    errors={"base": "no_signal"},
+                    errors={"base": self._learn_capture_error()},
                     description_placeholders=self._learn_press_placeholders("电源键", 1),
                 )
             self._learn_stop_capture()
@@ -862,7 +962,7 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_show_form(
                     step_id="learn_press2",
                     data_schema=self._learn_action_schema(),
-                    errors={"base": "no_signal"},
+                    errors={"base": self._learn_capture_error()},
                     description_placeholders=self._learn_press_placeholders(key_hint, 2),
                 )
             self._learn_stop_capture()
@@ -885,14 +985,91 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }
         )
 
+    def _learn_capture_error(self) -> str:
+        """收到 0 帧时报哪个错。
+
+        订阅本身就没成功的话，报 `no_signal`（"请对准接收器"）是**误导** —— 用户会一直
+        重按遥控器，而根因在实体上面。所以订阅失败、实体不可用都单独报，把"0 帧"
+        拆成三种互不相干的病因：
+
+        - `subscribe_failed`   —— 压根没订阅上（实体不是 infrared 接收实体等）
+        - `receiver_unavailable` —— 实体没了 / 设备离线
+        - `no_signal`          —— 订阅正常但没收到，这才是"对准 + 再按一次"
+        """
+        if self._learn_subscribe_error:
+            return "subscribe_failed"
+        if not self._receiver_available():
+            return "receiver_unavailable"
+        return "no_signal"
+
     def _learn_press_placeholders(self, key_hint: str, seq: int) -> dict[str, str]:
+        """learn_press / learn_press2 的占位符。
+
+        `receiver_state` 与 `subscribe_error` 是**诊断字段**：它们把"0 帧"拆成
+        "帧没进 HA"（接收器选错/设备离线）和"进了 HA 但我们没解码"两种，用户自己就能分。
+        """
+        subscribe_error = (
+            f"\n\n⚠️ **订阅接收器失败**：`{self._learn_subscribe_error}`"
+            " —— 该实体可能不是红外接收实体，或已从 HA 移除。"
+            if self._learn_subscribe_error
+            else ""
+        )
         return {
             "key_hint": key_hint,
             "seq": str(seq),
-            "receiver": self._receiver,
+            "receiver": self._receiver_label(),
             "category": self._category_label(),
             "captured": str(len(self._learn_captures)),
+            "receiver_state": self._receiver_state(),
+            "subscribe_error": subscribe_error,
         }
+
+    def _learn_capture_report(self) -> str:
+        """把"这次到底拿什么数据去匹配的"摊开写给人看。
+
+        必要性（实测踩到）：`learn_press` 上那句"已收到 N 帧"是**打开页面那一刻的快照**
+        —— 用户永远是先看到页面、再按遥控器，所以那句几乎总显示 0。于是"0 帧却出了
+        候选"看起来像**乱选**（用户原话）。其实帧收得好好的。所以匹配页必须把
+        「实际用了几帧、每帧多少段、首脉冲多长」原文摆出来，让"有没有真收到码"
+        变成可对账的事实，而不是一句会误导人的计数。
+        """
+        parts: list[str] = []
+        for capture, label in (
+            (self._learn_capture1, "电源键"),
+            (self._learn_capture2, "第 2 键"),
+        ):
+            if not capture:
+                continue
+            count, first, total = capture_features(capture)
+            parts.append(
+                f"{label}：{count} 段 / 首脉冲 {first} µs / 全长 {total} µs"
+            )
+        if not parts:
+            return "（没有可用的捕获）"
+        return "；".join(parts)
+
+    def _learn_verdict(self) -> str:
+        """候选可信度判词 —— 直接告诉用户"能不能信这个结果"。
+
+        分界值来自 `tools/verify_learn_ac.py` + 库外遥控的实测对照：
+        库里真值 ≥0.90、同族近似 ≈0.85、库外遥控最近邻 ≤0.75。
+        """
+        score = self._learn_top_score
+        keys = "两键交集" if self._learn_used_two_keys else "只用电源键"
+        if score >= _LEARN_TRUST_SCORE:
+            return f"✅ 最高相似度 **{score:.2f}**（{keys}）：**可信**，第一个候选基本就是它。"
+        if score >= _LEARN_WEAK_SCORE:
+            return (
+                f"⚠️ 最高相似度 **{score:.2f}**（{keys}）：**偏低**。可能对、也可能是"
+                "同族近似型号 —— 发实测码试一下最直接；没反应就重新配对并按第 2 键。"
+            )
+        return (
+            f"❌ 最高相似度 **{score:.2f}**（{keys}）：**太低，基本可以断定这只遥控**"
+            "**不在码库里**（库里真值一般 ≥0.90）。下面列出的只是最近邻，"
+            "**不是匹配结果**，别指望它管用。请选「↩ 退回重按」重新配对（务必按"
+            "第 2 键）；确认遥控没按错、也对准了接收器之后还是这样，就改用"
+            "「手动选择码库」按品牌型号挑，或换用能自学习的方案。"
+        )
 
     def _learn_converge(self, scores1: dict, scores2: dict | None, what: str) -> list:
         """有第二键就取交集，否则（或交集为空）退回单键排序。"""
@@ -956,6 +1133,13 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         self._learn_top_score = hits1[0]["score"] if hits1 else 0.0
         scores1 = _bin_scores(hits1)
+        # 候选数与最高分是判断"库里有/没有这只遥控"的唯一依据：
+        # 库里真值 → 十几个到几十个候选、最高 ~0.94；库外遥控 → 1~2 个、最高 ≤0.75。
+        _LOGGER.info(
+            "IR Hub learn(AC): 候选 %d 个，top5 %s",
+            len(hits1),
+            [(hit["bin"], round(hit["score"], 3)) for hit in hits1[:5]],
+        )
 
         scores2 = None
         capture2 = self._learn_capture2
@@ -1014,8 +1198,21 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         return options
 
+    async def _learn_restart(self):
+        """退回「按第 1 键」重新配对（清掉上一轮候选与捕获）。"""
+        self._learn_candidates = None
+        self._learn_capture1 = None
+        self._learn_capture2 = None
+        self._learn_used_two_keys = False
+        self._learn_top_score = 0.0
+        return await self.async_step_learn_press()
+
     async def async_step_learn_pick(self, user_input: dict | None = None):
-        """学习模式第 4 步：从匹配到的候选里挑一个型号。"""
+        """学习模式第 4 步：从匹配到的候选里挑一个型号。
+
+        下拉末尾挂一个「↩ 退回重按」。分数太低时（库外遥控）列表里全是错的，
+        没有这一项用户就没有出口 —— 只能关掉对话框从头再来。
+        """
         library = await self._async_library()
 
         if self._learn_candidates is None:
@@ -1023,6 +1220,8 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             picked = str(user_input[CONF_DEVICE])
+            if picked == _LEARN_BACK:
+                return await self._learn_restart()
             if self._category == CATEGORY_AC:
                 return await self._async_pick_ac(picked)
             device_id = int(picked)
@@ -1036,15 +1235,18 @@ class IrHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         options = await self._learn_pick_options(library)
         if not options:
             return self.async_abort(reason="learn_no_match")
+        options[_LEARN_BACK] = "↩ 这些都不是我的型号 —— 退回重按"
 
         return self.async_show_form(
             step_id="learn_pick",
             data_schema=vol.Schema({vol.Required(CONF_DEVICE): vol.In(options)}),
             description_placeholders={
-                "count": str(len(options)),
+                "count": str(len(options) - 1),
                 "category": self._category_label(),
                 "keys": "两键交集" if self._learn_used_two_keys else "仅电源键",
                 "score": f"{self._learn_top_score:.2f}",
+                "capture": self._learn_capture_report(),
+                "verdict": self._learn_verdict(),
             },
         )
 

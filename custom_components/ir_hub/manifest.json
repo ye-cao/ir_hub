@@ -1,7 +1,7 @@
 {
   "domain": "ir_hub",
   "name": "IR Hub",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "documentation": "https://github.com/ye-cao/ir_hub",
   "issue_tracker": "https://github.com/ye-cao/ir_hub/issues",
   "codeowners": [

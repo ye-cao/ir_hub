@@ -49,19 +49,19 @@
       },
       "learn_press": {
         "title": "IR Hub — Key {seq}: press the remote",
-        "description": "Receiver: **{receiver}**\n\nPoint the original remote at the receiver, press **{key_hint}**, then hit Submit.\n\n({captured} frame(s) captured; if none, press again and submit again.)",
+        "description": "Receiver: **{receiver}**\nState: `{receiver_state}`{subscribe_error}\n\nPoint the original remote AT the receiver above, press **{key_hint}**, then Submit.\n\n> \"{captured} frames captured\" is a SNAPSHOT taken when this page opened — you press the remote afterwards, so it usually shows 0 and does NOT mean nothing was received. The frames actually used for matching are listed on the next screen.\n\n> The state is the probe: after pressing the remote it should turn into a timestamp. Unchanged = the frame never reached HA (the dropdown points at another device, or that device is offline). Changed but still \"no signal\" = the problem is in this integration; please report that line.",
         "data": {}
       },
       "learn_press2": {
         "title": "IR Hub — Key {seq} (optional): narrow the model",
-        "description": "Receiver: **{receiver}**\n\nPress **{key_hint}** and submit — intersecting two keys filters out most same-code / look-alike models (extra useful for air conditioners: models in the same protocol family are indistinguishable from the power key alone).\n\nOr pick \"Skip\" to match on the power key only (more candidates). {captured} frame(s) captured.",
+        "description": "Receiver: **{receiver}**\nState: `{receiver_state}`{subscribe_error}\n\nPress **{key_hint}** once more and submit — intersecting both keys throws away most of the same-code / near-code models (air conditioners especially: same protocol family cannot be told apart from the power key alone).\n\nPick \"skip\" to match on the power key only (more candidates). Again, \"{captured} frames captured\" is a snapshot from when this page opened.",
         "data": {
           "learn_action": "Next"
         }
       },
       "learn_pick": {
         "title": "IR Hub — Confirm the matched model",
-        "description": "Matched **{count}** candidate models in **{category}** ({keys}, best similarity {score}).\n\nCandidates are ranked by similarity — find your own brand/model. Models of the same protocol family show up together (their codes are nearly identical, so any of them usually works); a brand match is the safest pick. A candidate labelled \"shared by N brands\" is a **generic code**, not a wrong match.\n\nA test frame is sent next (air conditioners get a two-stage power-on → power-off confirmation).",
+        "description": "Matched **{count}** candidate model(s) in **{category}** ({keys}, best similarity {score}).\n\nFrames actually used — {capture}\n\n{verdict}\n\nCandidates are sorted by similarity; pick your own brand/model (entries marked \"shared by N brands\" are generic codes, not a mistake). The next step sends a real test frame (air conditioners send \"power on, then off\"). If none looks right, pick the last entry \"↩ None of these — re-capture\".",
         "data": {
           "device": "Model"
         }
@@ -119,7 +119,9 @@
       "no_test_key": "This model has no usable test code in the library. You can skip the test and finish anyway.",
       "target_missing": "The transmitter target does not exist or is unavailable (entity offline / ESPHome action not registered / Broadlink entity missing). Check and retry.",
       "mqtt_missing": "The MQTT integration is not loaded — configure an MQTT broker in HA first, then use the MQTT channel.",
-      "no_signal": "No infrared signal captured. Point the remote AT the receiver (5–30 cm), press again, then submit again. Check the batteries too."
+      "no_signal": "No infrared signal captured. Point the remote AT the receiver (5-30 cm), press again, then submit again. Check the batteries too.\n\nStill nothing? Look at the \"state\" line above: after pressing the remote it should turn into a timestamp. Unchanged = the frame never reached HA (wrong receiver picked — another device — or that device is offline). Changed but still \"no signal\" here = the problem is in this integration; please report that line.",
+      "subscribe_failed": "**Could not subscribe to the receiver.** Go back one step and pick another receiver (the dropdown shows which device each one belongs to); see the note above for the exact reason.",
+      "receiver_unavailable": "The selected receiver entity does not exist, or that device is offline (see the state line above). Go back one step and make sure the dropdown points at the device you are aiming at."
     }
   },
   "options": {

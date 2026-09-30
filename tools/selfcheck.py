@@ -148,6 +148,26 @@ def check_manifests() -> None:
     check(bool(config_steps), f"config_flow 里解析出 config step {sorted(config_steps)}")
     check(bool(reasons), f"config_flow 里解析出 abort reason {sorted(reasons)}")
 
+    # error 键同理：`_learn_capture_error` 返回的每个键都必须在翻译里存在 ——
+    # 少一个，用户在表单顶部看到的就是**原始英文键名**（例如 receiver_unavailable），
+    # 比不报错还难懂。0 帧的三种病因（订阅失败 / 实体不在 / 真没信号）就靠这条兜住。
+    _seq = src.split("def _learn_capture_error", 1)
+    code_errors = (
+        {
+            chunk.split('"', 1)[0]
+            # 只取这一个方法的函数体（到下一个方法定义为止），否则会把后面
+            # _learn_capture_report 之类的 return "..." 也算进来
+            for chunk in _seq[1].split("\n    def ", 1)[0].split('return "')[1:]
+        }
+        if len(_seq) > 1
+        else set()
+    )
+    check(
+        len(code_errors) == 3,
+        f"_learn_capture_error 解析出 3 种 0 帧病因 {sorted(code_errors)}",
+    )
+    missing_error_keys: list[str] = []
+
     for lang in langs:
         blob = json.load(open(os.path.join(tdir, lang), encoding="utf-8"))
         cfg = blob.get("config", {})
@@ -203,6 +223,16 @@ def check_manifests() -> None:
             == {"carrier", "repeats", "tx_delay", "mqtt_format"},
             f"{lang}: options 步 data 键 = carrier/repeats/tx_delay/mqtt_format",
         )
+        missing_error_keys += [
+            f"{lang}.{key}"
+            for key in sorted(code_errors - set(cfg.get("error", {})))
+        ]
+
+    check(
+        not missing_error_keys,
+        f"每个语言文件都覆盖 0 帧的三种 error 键（{sorted(code_errors)}）",
+        f"缺 {missing_error_keys}",
+    )
 
 
 def check_learn_match() -> None:
@@ -940,8 +970,11 @@ def _install_config_flow_stubs() -> None:
 
     infrared.STUB_SUBSCRIBERS = []      # [(entity_id, callback)]
     infrared.STUB_EMIT_RECEIVED = None  # 由下面的闭包赋值
+    infrared.STUB_SUBSCRIBE_ERROR = None  # 设成异常实例则订阅时抛错（测"订阅失败"路径）
 
     def _stub_subscribe_receiver(hass, entity_id, callback):
+        if infrared.STUB_SUBSCRIBE_ERROR is not None:
+            raise infrared.STUB_SUBSCRIBE_ERROR
         subscriber = (entity_id, callback)
         infrared.STUB_SUBSCRIBERS.append(subscriber)
 
@@ -1234,11 +1267,17 @@ def check_config_flow() -> None:
     EMITTER = "infrared.ir_control_ir_transmitter"
 
     class FakeState:
-        def __init__(self, entity_id: str):
+        def __init__(self, entity_id: str, **attributes) -> None:
             self.entity_id = entity_id
             self.domain = entity_id.split(".")[0]
+            self.state = attributes.pop("state", "unknown")
+            self.attributes = attributes
 
     class FakeStates:
+        # 用例里现挂的状态（如红外接收器）。`get()` 每次现查这张表，所以可以
+        # 先注册状态、再 `new_flow()`。
+        extra: dict[str, "FakeState"] = {}
+
         def __init__(self) -> None:
             self._all = [
                 FakeState("remote.broadlink_livingroom"),
@@ -1250,6 +1289,8 @@ def check_config_flow() -> None:
             return [s for s in self._all if s.domain == domain]
 
         def get(self, entity_id: str):
+            if entity_id in FakeStates.extra:
+                return FakeStates.extra[entity_id]
             for state in self._all:
                 if state.entity_id == entity_id:
                     return state
@@ -1523,13 +1564,19 @@ def check_config_flow() -> None:
             flow_mod._HAS_RECEIVER_API = saved_flag
 
         infrared.STUB_RECEIVERS = [RECEIVER]
+        # 接收器实体挂上 friendly_name / state：下拉要显示设备名，learn_press 要显示状态
+        FakeStates.extra = {
+            RECEIVER: FakeState(RECEIVER, friendly_name="HJY IR 红外接收")
+        }
         fl = new_flow()
         await fl.async_step_user({"tx_type": "infrared", "mode": "learn"})
         check(fl.shown.get("step_id") == "learn_setup", "learn 模式 -> 进 learn_setup 步")
         ls = fl.shown["data_schema"]
         check(
-            _schema_options(ls, "receiver") == {RECEIVER: RECEIVER},
-            "learn_setup 列出全部接收器实体",
+            _schema_options(ls, "receiver")
+            == {RECEIVER: f"HJY IR 红外接收（{RECEIVER}）"},
+            "learn_setup 接收器下拉带设备名（多台 IR 设备时唯一能分辨「该按哪一台」的线索）",
+            f"实际 {_schema_options(ls, 'receiver')!r}",
         )
         lcats = _schema_options(ls, "category") or {}
         check(
@@ -1545,6 +1592,64 @@ def check_config_flow() -> None:
             and infrared.STUB_SUBSCRIBERS[0][0] == RECEIVER,
             "learn_press 已订阅所选接收器",
         )
+        ph_press = fl.shown["description_placeholders"]
+        check(
+            ph_press.get("receiver") == f"HJY IR 红外接收（{RECEIVER}）"
+            # unknown 会被解释成"这台接收器从未收到过任何一帧"（正是"选错设备"的指纹）
+            and ph_press.get("receiver_state", "").startswith("unknown")
+            and ph_press.get("subscribe_error") == "",
+            "learn_press 显示接收器设备名 + 实体状态（帧有没有进 HA 的探针）+ 订阅结果",
+            f"实际 receiver={ph_press.get('receiver')!r} "
+            f"state={ph_press.get('receiver_state')!r}",
+        )
+
+        # 订阅失败必须报 subscribe_failed 并带出原因 —— 报 no_signal（「对准接收器」）
+        # 是误导：用户会一直重按遥控器，而根因在实体上。
+        infrared.STUB_SUBSCRIBE_ERROR = RuntimeError("receiver_not_found")
+        try:
+            fl_sub = new_flow()
+            await fl_sub.async_step_user({"tx_type": "infrared", "mode": "learn"})
+            await fl_sub.async_step_learn_setup(
+                {"tx_target": EMITTER, "receiver": RECEIVER, "category": "2"}
+            )
+            await fl_sub.async_step_learn_press({})
+            ph_sub = fl_sub.shown["description_placeholders"]
+            check(
+                (fl_sub.shown.get("errors") or {}).get("base") == "subscribe_failed"
+                and "receiver_not_found" in ph_sub.get("subscribe_error", ""),
+                "订阅失败 -> errors.subscribe_failed 且原因带到表单（不再冒充 no_signal）",
+                f"实际 errors={fl_sub.shown.get('errors')!r} "
+                f"subscribe_error={ph_sub.get('subscribe_error')!r}",
+            )
+        finally:
+            infrared.STUB_SUBSCRIBE_ERROR = None
+
+        # 接收器实体根本不存在（设备被删/改名/换机）-> receiver_unavailable。
+        # 这种 0 帧既不是"订阅失败"也不是"你对准了却没按到"，必须单独报，
+        # 否则用户会一直重复"对准 + 重按"，方向完全错。
+        saved_extra = FakeStates.extra
+        saved_subs = list(infrared.STUB_SUBSCRIBERS)
+        FakeStates.extra = {}
+        try:
+            fl_gone = new_flow()
+            await fl_gone.async_step_user({"tx_type": "infrared", "mode": "learn"})
+            await fl_gone.async_step_learn_setup(
+                {"tx_target": EMITTER, "receiver": RECEIVER, "category": "2"}
+            )
+            await fl_gone.async_step_learn_press({})
+            ph_gone = fl_gone.shown["description_placeholders"]
+            check(
+                (fl_gone.shown.get("errors") or {}).get("base") == "receiver_unavailable"
+                and "不存在" in ph_gone.get("receiver_state", ""),
+                "接收器实体不存在 -> errors.receiver_unavailable（0 帧的第三种病因）",
+                f"实际 errors={fl_gone.shown.get('errors')!r} "
+                f"state={ph_gone.get('receiver_state')!r}",
+            )
+        finally:
+            FakeStates.extra = saved_extra
+            # 这个探测流程是丢弃的，它订上的接收器不会自己退 ⇒ 复原订阅表，
+            # 否则后面「订阅数恰为 1」那条断言会被这里的残留搞红。
+            infrared.STUB_SUBSCRIBERS[:] = saved_subs
 
         # 没按遥控器就提交 -> no_signal，且订阅保持（用户可直接再按再提交）
         await fl.async_step_learn_press({})
@@ -1575,6 +1680,38 @@ def check_config_flow() -> None:
         cands1 = _schema_options(fl.shown["data_schema"], "device") or {}
         check("47" in cands1, f"单键匹配候选含真值 TCL电视-1（{len(cands1)} 个候选）")
         check(fl._learn_used_two_keys is False, "跳过后标记为『仅电源键』")
+
+        # 候选下拉末尾必须有「退回重按」出口 —— 分数太低时（库外遥控）列表里全是错的，
+        # 没有这一项用户就只能关掉对话框从头再来，等于"配对没有出口"。
+        ph_pick = fl.shown["description_placeholders"]
+        check(
+            "__back__" in cands1,
+            "learn_pick 有「退回重按」出口（低分/库外遥控时唯一的出路）",
+            f"实际选项 {sorted(cands1)[:2]}…（共 {len(cands1)}）",
+        )
+        check(
+            ph_pick.get("count") == str(len(cands1) - 1),
+            "候选数不含「退回重按」这一项（{count} 不能虚报）",
+            f"实际 count={ph_pick.get('count')!r} / 选项 {len(cands1)}",
+        )
+        # 实测踩到：learn_press 上那句"已收到 N 帧"是快照，用户先看页面后按遥控器
+        # ⇒ 几乎总显示 0，被读成"没收到码"甚至"0 帧也能匹配 = 乱选"。所以匹配页必须
+        # 摊开真正用的帧（段数/首脉冲）并给一句判词。
+        check(
+            "段" in ph_pick.get("capture", "")
+            and "µs" in ph_pick.get("capture", "")
+            and "相似度" in ph_pick.get("verdict", ""),
+            "learn_pick 摊开真实匹配数据（段数/首脉冲/全长）+ 给出可信度判词",
+            f"实际 capture={ph_pick.get('capture')!r} verdict={ph_pick.get('verdict')!r}",
+        )
+        await fl.async_step_learn_pick({"device": "__back__"})
+        check(
+            fl.shown.get("step_id") == "learn_press"
+            and fl._learn_candidates is None
+            and fl._learn_capture1 is None,
+            "选「退回重按」-> 回 learn_press 且清空候选/捕获",
+            f"实际 step={fl.shown.get('step_id')!r} cands={fl._learn_candidates!r}",
+        )
 
         # 两键路径（真值必须在交集里）
         fl2 = new_flow()
@@ -2457,12 +2594,18 @@ def main() -> int:
     #        详见「⑩ 学习模式」段：mode/abort/订阅/no_signal/单键/双键/pick/test/entry
     #      + [13] learn_match 不变式 7 项  = 223
     #      + ⑪ 空调也能配对 13 项          = 236
-    #        （选空调大类 / 捕获电源键 / 占位符改写 / 单键候选含真值 /
+    #      + 接收端诊断 2 项（接收器状态探针 / 订阅失败不再冒充没信号） = 238
+    #      + 0 帧病因护栏 3 项（解析出 3 种病因 / 每语言都覆盖这 3 个 error 键 /
+    #        实体不存在 -> receiver_unavailable）                    = 241
+    #      + learn_pick 3 项（「退回重按」出口 / {count} 不含该项 /
+    #        摊开真实匹配数据 + 可信度判词）                          = 244
+    #      + 「退回重按」导航 1 项（回 learn_press 且清空候选/捕获）   = 245
+    #        （⑪ 明细：选空调大类 / 捕获电源键 / 占位符改写 / 单键候选含真值 /
     #          共用码候选名不冒认品牌 / 进 ac_test_on + 真发帧 /
     #          共用码实测文案 / retry 退回候选 / ok 进 ac_test /
     #          entry 校验（共用码品牌留空）/ 跨品牌『自动试下一个』 /
     #          两键交集仍含真值）
-    expected_total = 236
+    expected_total = 245
     seen = CHECKS + len(SKIPPED)
     if seen != expected_total:
         FAILURES.append(
